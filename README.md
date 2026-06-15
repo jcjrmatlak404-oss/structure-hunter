@@ -1,3 +1,5 @@
+![Structure Hunter](docs/hero.png)
+
 # Structure Hunter
 
 **A survey console for finding structures that exist on the ground but are missing, hidden, or unacknowledged in official records.**
@@ -6,7 +8,7 @@ Structure Hunter cross-references *what is physically there* — building footpr
 
 It runs entirely on your own machine as a local web app. Everything it uses is public, authoritative data: OpenStreetMap and state building footprints, the National Address Database and state address points, county parcel layers, and USGS 3DEP LiDAR and elevation models.
 
-![Structure Hunter console](docs/screenshot.png)
+![The Structure Hunter console](docs/screenshot.png)
 
 ---
 
