@@ -1,0 +1,23 @@
+# Cache of downloaded LiDAR tiles, grids, and rendered images
+cache/
+
+# Generated output files
+candidates.csv
+candidates.geojson
+lidar_candidates.csv
+lidar_candidates.geojson
+*.asc
+*_elev.png
+*_ground.png
+ndsm_*.png
+
+# Server logs / pids
+server.log
+server.pid
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
