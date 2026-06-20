@@ -13,7 +13,6 @@ It runs entirely on your own machine as a local web app. Everything it uses is p
 ![The Structure Hunter console](docs/screenshot2.png)
 ![The Structure Hunter console](docs/screenshot3.png)
 ![The Structure Hunter console](docs/screenshotb44.png)
-![The Structure Hunter console](docs/screenshot4.png)
 ![The Structure Hunter console](docs/screenshot5.png)
 ![The Structure Hunter console](docs/screenshot6.png)
 ![The Structure Hunter console](docs/screenshot7.png)
