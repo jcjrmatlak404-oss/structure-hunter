@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # ============================================================================
 # hunter_app.rb — local web interface for the structure-hunting toolkit
-# BUILD: v34-glow-match (live picture controls · cache panel · relief render)
+# BUILD: v47-roof-shape (live picture controls · cache panel · relief render)
 #
 # Run:     ruby hunter_app.rb          (then open http://localhost:8080)
 # Stop:    Ctrl+C
@@ -100,6 +100,182 @@ def lone_circle?(d)
   d[:circularity] > 0.88 && d[:solidity] > 0.92 &&
     d[:aspect] >= 0.8 && d[:aspect] <= 1.25 &&
     d[:extent] >= 0.74 && d[:extent] <= 0.84
+end
+
+# Minimum-area oriented bounding rectangle of a point set (meters), via rotating
+# the hull to each edge's angle and taking the tightest box. Returns the box's
+# long side, short side, fill ratio (area / box area), and orientation in degrees.
+# Unlike an axis-aligned box, this gives the TRUE length/width even for a
+# structure sitting at an angle — essential for telling "long thin barn" from
+# "square house" regardless of how it's oriented on the map.
+def min_area_rect(points, area)
+  hull = convex_hull(points)
+  return nil if hull.size < 3
+  best = nil
+  n = hull.size
+  n.times do |i|
+    ax, ay = hull[i]
+    bx, by = hull[(i + 1) % n]
+    ex = bx - ax; ey = by - ay
+    len = Math.hypot(ex, ey)
+    next if len < 1e-9
+    ux = ex / len; uy = ey / len      # edge direction (unit)
+    px = -uy; py = ux                 # perpendicular (unit)
+    min_u = min_v = Float::INFINITY
+    max_u = max_v = -Float::INFINITY
+    hull.each do |hx, hy|
+      du = hx * ux + hy * uy
+      dv = hx * px + hy * py
+      min_u = du if du < min_u; max_u = du if du > max_u
+      min_v = dv if dv < min_v; max_v = dv if dv > max_v
+    end
+    w = max_u - min_u; h = max_v - min_v
+    a = w * h
+    if best.nil? || a < best[:box_area]
+      ang = Math.atan2(uy, ux) * 180 / Math::PI
+      best = { box_area: a, long: [w, h].max, short: [w, h].min, angle: ang }
+    end
+  end
+  return nil unless best
+  best[:fill] = best[:box_area] > 0 ? area / best[:box_area] : 1.0  # 1=perfect rectangle
+  best[:elong] = best[:short] > 0 ? best[:long] / best[:short] : 1.0
+  best
+end
+
+# Classify a footprint into a shape family and a likely structure type, from its
+# geometric descriptors and real area. Returns { shape:, type:, long:, short: }.
+# Everything is a LIKELIHOOD, not a certainty — the footprint is the roof-down
+# outline, so size + shape narrow the options but can't prove use.
+def classify_footprint(points, area, perimeter)
+  d = shape_descriptors(points, area, perimeter)
+  return { shape: 'unknown', type: '', long: nil, short: nil } unless d
+  rect = min_area_rect(points, area)
+  long  = rect ? rect[:long] : nil
+  short = rect ? rect[:short] : nil
+  elong = rect ? rect[:elong] : d[:aspect]
+  fill  = rect ? rect[:fill] : d[:extent]
+  sol   = d[:solidity]
+  circ  = d[:circularity]
+
+  # ---- shape family ----
+  shape =
+    if circ > 0.85 && elong < 1.3 && fill.between?(0.74, 0.86)
+      'circular'
+    elsif fill >= 0.90 && sol >= 0.90
+      elong >= 3.0 ? 'long rectangle' : (elong <= 1.2 ? 'square' : 'rectangle')
+    elsif sol >= 0.78 && fill >= 0.62
+      # fills a good part of its hull but not its box -> a rectangle with a bite:
+      # L / T / U shapes (very common for houses with wings/additions)
+      'L / T-shaped'
+    elsif elong >= 3.5
+      'elongated'
+    elsif sol < 0.7
+      'irregular'
+    else
+      elong >= 1.8 ? 'rectangle' : 'blocky'
+    end
+
+  # ---- likely type, from shape + size (m^2) ----
+  type =
+    if shape == 'circular'
+      area < 60 ? 'tank / bin' : 'tank / silo'
+    elsif shape == 'elongated' || shape == 'long rectangle'
+      if area < 120 then 'mobile home / trailer-like'
+      elsif area < 400 then 'barn / stable / long building'
+      else 'large agricultural / warehouse' end
+    elsif shape == 'irregular'
+      area > 500 ? 'large complex / multi-building' : 'irregular structure'
+    else  # square, rectangle, blocky, L/T
+      if area < 25 then 'small shed / outbuilding'
+      elsif area < 70 then 'shed / garage / cabin'
+      elsif area < 350 then (shape == 'L / T-shaped' ? 'likely dwelling (with wing)' : 'possible dwelling')
+      elsif area < 1200 then 'large building / commercial'
+      else 'warehouse / industrial' end
+    end
+
+  { shape: shape, type: type, long: long, short: short }
+end
+
+# From a LiDAR blob's height statistics, infer the roof form. `rough` is the
+# standard deviation of height-above-ground across the blob (flat roofs vary
+# little; pitched roofs vary moderately and structurally; very steep/complex
+# roofs vary a lot). `mean` is the mean height. Returns a short label.
+def roof_shape(mean, rough)
+  return '' unless mean && rough
+  if rough < 0.45 then 'flat roof'
+  elsif rough < 1.3 then 'pitched roof'
+  elsif rough < 2.5 then 'steep / complex roof'
+  else 'very tall / irregular'
+  end
+end
+
+# Refine a footprint type guess using the roof form, for LiDAR candidates where
+# we have height data. A pitched roof on a house-sized rectangle strengthens
+# "dwelling"; a flat roof on the same shape leans commercial/shed/mobile. Domed
+# circular = silo vs flat circular = tank. Returns a possibly-updated type, and
+# the roof label, so the UI can show both.
+def refine_type_with_roof(cls, area, mean, rough)
+  roof = roof_shape(mean, rough)
+  type = cls[:type].to_s
+  shape = cls[:shape].to_s
+  return [type, roof] if roof.empty?
+
+  square_ish = %w[square rectangle blocky].include?(shape) || shape == 'L / T-shaped'
+  if square_ish && area >= 60 && area < 400
+    type =
+      case roof
+      when 'pitched roof'        then 'likely dwelling (pitched roof)'
+      when 'flat roof'           then 'flat-roof building (shed / commercial / mobile)'
+      when 'steep / complex roof' then 'likely dwelling (complex roof)'
+      else type
+      end
+  elsif shape == 'circular'
+    type = roof == 'flat roof' ? 'tank (flat top)' : 'silo / bin (domed)'
+  elsif (shape == 'long rectangle' || shape == 'elongated') && roof == 'pitched roof' && area < 400
+    type = 'barn / gabled long building'
+  end
+  [type, roof]
+end
+
+# Draw a tiny SVG glyph of the actual footprint outline, scaled so that its
+# on-glyph size reflects the REAL structure size: a small shed fills only a
+# little of the box, a warehouse nearly fills it. A faint reference square marks
+# a fixed real-world size (~25 m) so the eye reads absolute scale, not just shape.
+# `points` are boundary coords in meters; pass the long/short for the label.
+def shape_glyph_svg(points, long_m, short_m)
+  return '' if points.nil? || points.size < 3
+  xs = points.map { |p| p[0] }; ys = points.map { |p| p[1] }
+  cx = (xs.min + xs.max) / 2.0; cy = (ys.min + ys.max) / 2.0
+  # real extent of the structure (meters), with a floor so dots aren't invisible
+  real_w = [xs.max - xs.min, 1.0].max
+  real_h = [ys.max - ys.min, 1.0].max
+  real_span = [real_w, real_h].max
+
+  box = 46            # glyph viewport (px)
+  pad = 5
+  # Scale: a REFERENCE_M structure fills the drawable area. Bigger real
+  # structures are clamped to fit but still read as "large" (near-full box).
+  ref_m = 40.0
+  draw = box - pad * 2
+  scale = draw / [real_span, ref_m].max     # px per meter (shared x & y -> true proportions)
+
+  pts = points.map do |x, y|
+    px = box / 2.0 + (x - cx) * scale
+    py = box / 2.0 - (y - cy) * scale       # flip y for screen coords
+    "#{px.round(1)},#{py.round(1)}"
+  end.join(' ')
+
+  # reference square = 25 m, drawn faint so size is judgeable at a glance
+  refpx = 25.0 * scale
+  rx = box - pad - refpx
+  ry = box - pad - refpx
+  ref = refpx.between?(4, box) ?
+    %(<rect x="#{rx.round(1)}" y="#{ry.round(1)}" width="#{refpx.round(1)}" height="#{refpx.round(1)}" fill="none" stroke="#46d39a" stroke-opacity="0.35" stroke-dasharray="2 2"/>) : ''
+
+  %(<svg class="glyph" viewBox="0 0 #{box} #{box}" width="#{box}" height="#{box}" xmlns="http://www.w3.org/2000/svg">) +
+    ref +
+    %(<polygon points="#{pts}" fill="#f0a830" fill-opacity="0.22" stroke="#f0a830" stroke-width="1.3" stroke-linejoin="round"/>) +
+    %(</svg>)
 end
 
 def point_in_ring?(lng, lat, ring)
@@ -204,10 +380,38 @@ def load_parcels(path, field, box)
       else next
       end
     next unless in_box?(rings[0][0][0], rings[0][0][1], box)
-    raw = (f['properties'] || {})[field]
-    out << [rings, raw.nil? ? nil : raw.to_f]
+    props = f['properties'] || {}
+    raw = props[field]
+    # Rich context for accuracy judgement (NC OneMap field names; nil-safe so
+    # other parcel sources that lack these simply carry blanks).
+    ctx = {
+      imp: raw.nil? ? nil : raw.to_f,
+      use_code: (props['parusecode'] || props['PARUSECODE']).to_s.strip,
+      use_desc: (props['parusedesc'] || props['PARUSEDESC']).to_s.strip,
+      use_desc2: (props['parusedsc2'] || props['PARUSEDSC2']).to_s.strip,
+      owner_type: (props['owntype'] || props['OWNTYPE']).to_s.strip,
+      owner: (props['ownname'] || props['OWNNAME']).to_s.strip,
+      acres: (props['gisacres'] || props['GISACRES']),
+      site_addr: (props['siteadd'] || props['SITEADD']).to_s.strip,
+      has_struct: (props['struct'] || props['STRUCT']).to_s.strip
+    }
+    out << [rings, ctx]
   end
   out
+end
+
+# Decide if a parcel's use looks NON-residential (commercial / industrial /
+# rail / utility / agricultural-operation) from its use description text.
+# Works across counties by matching words rather than county-specific codes.
+NONRES_WORDS = %w[COMMERC INDUST RAIL WAREHOUS MANUF UTILIT SUBSTAT
+                  STORAGE PLANT FACTOR TERMINAL DEPOT FREIGHT QUARRY MINE
+                  REFINER YARD PORT AIRPORT HANGAR].freeze
+def parcel_use_flag(ctx)
+  return nil unless ctx.is_a?(Hash)
+  d = "#{ctx[:use_desc]} #{ctx[:use_desc2]}".upcase
+  return nil if d.strip.empty?
+  hit = NONRES_WORDS.find { |w| d.include?(w) }
+  hit ? ctx[:use_desc] : nil
 end
 
 # ============================================================================
@@ -225,6 +429,84 @@ end
 # manual fields is higher quality.
 # ============================================================================
 CACHE_DIR = File.join(__dir__, 'cache')
+DISMISS_FILE = File.join(CACHE_DIR, 'dismissed.json')
+EXAMINED_FILE = File.join(CACHE_DIR, 'examined.json')
+
+# Centers of LiDAR windows already examined, so "focus next unexamined" can
+# sweep forward through the candidate list across runs instead of repeating
+# the same #1 window every time. Matched by proximity to the window's snapped
+# center. Like dismissals, this persists and survives a cache clear.
+EXAMINED_RADIUS_M = 900.0   # within ~0.9 km counts as "same window already seen"
+
+def load_examined
+  return [] unless File.exist?(EXAMINED_FILE)
+  JSON.parse(File.read(EXAMINED_FILE), symbolize_names: true)
+rescue
+  []
+end
+
+def mark_examined(lat, lng)
+  list = load_examined
+  return if list.any? { |e| haversine_m(lat, lng, e[:lat], e[:lng]) <= EXAMINED_RADIUS_M }
+  list << { lat: lat.round(6), lng: lng.round(6), at: Time.now.strftime('%Y-%m-%d') }
+  Dir.mkdir(CACHE_DIR) unless Dir.exist?(CACHE_DIR)
+  File.write(EXAMINED_FILE, JSON.generate(list))
+end
+
+def examined?(examined, lat, lng)
+  examined.any? { |e| haversine_m(lat, lng, e[:lat], e[:lng]) <= EXAMINED_RADIUS_M }
+end
+
+# Locations the user has marked "not interesting" so future scans skip them.
+# Keyed to physical coordinates and matched by proximity, so dismissals persist
+# across runs and survive small coordinate wobble between data updates.
+DISMISS_RADIUS_M = 20.0
+
+def load_dismissed
+  return [] unless File.exist?(DISMISS_FILE)
+  JSON.parse(File.read(DISMISS_FILE), symbolize_names: true)
+rescue
+  []
+end
+
+def save_dismissed(list)
+  Dir.mkdir(CACHE_DIR) unless Dir.exist?(CACHE_DIR)
+  File.write(DISMISS_FILE, JSON.generate(list))
+end
+
+def add_dismissed(lat, lng, reason)
+  list = load_dismissed
+  # de-dupe: if one already sits within the match radius, just update it
+  list.reject! { |d| haversine_m(lat, lng, d[:lat], d[:lng]) <= DISMISS_RADIUS_M }
+  list << { lat: lat.round(6), lng: lng.round(6),
+            reason: reason.to_s.strip[0, 80],
+            at: Time.now.strftime('%Y-%m-%d') }
+  save_dismissed(list)
+  list.size
+end
+
+def remove_dismissed(lat, lng)
+  list = load_dismissed
+  list.reject! { |d| haversine_m(lat, lng, d[:lat], d[:lng]) <= DISMISS_RADIUS_M }
+  save_dismissed(list)
+  list.size
+end
+
+# Is this candidate location within the match radius of any dismissed point?
+# Returns the dismissed record (with its reason) or nil.
+def dismissed_match(dismissed, lat, lng)
+  dismissed.find { |d| haversine_m(lat, lng, d[:lat], d[:lng]) <= DISMISS_RADIUS_M }
+end
+
+# Small-distance great-circle metres (good enough at candidate scale).
+def haversine_m(lat1, lon1, lat2, lon2)
+  rad = Math::PI / 180
+  dlat = (lat2 - lat1) * rad
+  dlon = (lon2 - lon1) * rad
+  a = Math.sin(dlat / 2)**2 +
+      Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dlon / 2)**2
+  6_371_000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+end
 
 def cache_stats
   return { count: 0, bytes: 0, laz_count: 0, laz_bytes: 0, groups: {} } unless Dir.exist?(CACHE_DIR)
@@ -265,6 +547,8 @@ end
 def clear_cache(which)
   return 0 unless Dir.exist?(CACHE_DIR)
   files = Dir.glob(File.join(CACHE_DIR, '*')).select { |f| File.file?(f) }
+  # never delete the user's decisions — dismissals and examined-window history
+  files.reject! { |f| %w[dismissed.json examined.json].include?(File.basename(f)) }
   files = files.select { |f| f.end_with?('.laz') } if which == 'laz'
   freed = files.sum { |f| File.size(f) }
   files.each { |f| File.delete(f) }
@@ -308,6 +592,74 @@ def osm_fetch_buildings(box, key, log = NOOP_LOG)
     { 'type' => 'FeatureCollection', 'features' => feats }))
   log.("Buildings fetched: #{feats.size}")
   [fp_file, false]
+end
+
+# Fetch OSM industrial / railway land-use polygons and rail lines for a box.
+# Used to recognize when a candidate sits inside an industrial area or rail
+# yard — context the per-structure scan can't see on its own. Cached like the
+# building data. Returns a structure of zones for fast point-in-zone testing.
+def osm_fetch_zones(box, key, log = NOOP_LOG)
+  Dir.mkdir(CACHE_DIR) unless Dir.exist?(CACHE_DIR)
+  zf = File.join(CACHE_DIR, "osm_zones_#{key}.json")
+  if File.exist?(zf)
+    log.('Industrial/railway zones: using cache')
+    return JSON.parse(File.read(zf), symbolize_names: true)
+  end
+  log.('Fetching industrial & railway zones from OpenStreetMap...')
+  bbox = "#{box[1]},#{box[0]},#{box[3]},#{box[2]}"
+  q = %{[out:json][timeout:180];(} +
+      %{way["landuse"="industrial"](#{bbox});} +
+      %{way["landuse"="railway"](#{bbox});} +
+      %{way["landuse"="commercial"](#{bbox});} +
+      %{way["landuse"="quarry"](#{bbox});} +
+      %{way["man_made"="works"](#{bbox});} +
+      %{way["railway"="yard"](#{bbox});} +
+      %{way["aeroway"="aerodrome"](#{bbox});} +
+      %{way["railway"="rail"](#{bbox});} +
+      %{);out geom;}
+  els = overpass(q)
+  polys = []   # [label, [ [lng,lat],... ]]
+  rails = []   # [ [lng,lat],... ]  (rail centerlines, buffered at test time)
+  els.each do |el|
+    g = el['geometry'] or next
+    pts = g.map { |pt| [pt['lon'], pt['lat']] }
+    tags = el['tags'] || {}
+    if tags['railway'] == 'rail' && tags['landuse'].nil?
+      rails << pts if pts.size >= 2
+    else
+      next if pts.size < 4
+      pts << pts.first unless pts.first == pts.last
+      label =
+        if tags['landuse'] == 'railway' || tags['railway'] == 'yard' then 'rail yard'
+        elsif tags['landuse'] == 'industrial' || tags['man_made'] == 'works' then 'industrial zone'
+        elsif tags['landuse'] == 'quarry' then 'quarry'
+        elsif tags['aeroway'] then 'airport'
+        elsif tags['landuse'] == 'commercial' then 'commercial zone'
+        else 'industrial zone' end
+      polys << [label, pts]
+    end
+  end
+  data = { polys: polys, rails: rails }
+  File.write(zf, JSON.generate(data))
+  log.("Zones fetched: #{polys.size} areas, #{rails.size} rail lines")
+  JSON.parse(JSON.generate(data), symbolize_names: true)
+end
+
+# Is (lng,lat) inside any industrial/railway polygon, or within ~60 m of a rail
+# line? Returns the zone label (e.g. "rail yard") or nil.
+def zone_hit(zones, lng, lat)
+  return nil unless zones
+  (zones[:polys] || []).each do |label, ring|
+    return label if point_in_ring?(lng, lat, ring)
+  end
+  # near a rail line? cheap check: distance to any rail vertex under ~60 m
+  rail_tol = (60.0 / 111_320.0)  # ~60 m in degrees lat (approx; longitude close enough at test latitudes)
+  (zones[:rails] || []).each do |line|
+    line.each do |x, y|
+      return 'near rail line' if (x - lng).abs < rail_tol && (y - lat).abs < rail_tol
+    end
+  end
+  nil
 end
 
 def osm_fetch(box, log = NOOP_LOG)
@@ -431,7 +783,15 @@ def ncom_fetch(box, key, log = NOOP_LOG)
       # so the scorer reads it as 0.5 instead of a false 1.0.
       improv = nil if improv.to_f == 0 && pr['landval'].to_f == 0 &&
                       pr['parval'].to_f > 0
-      { 'type' => 'Feature', 'properties' => { 'IMPROVVAL' => improv },
+      { 'type' => 'Feature',
+        'properties' => {
+          'IMPROVVAL'  => improv,
+          'parusecode' => pr['parusecode'], 'parusedesc' => pr['parusedesc'],
+          'parusedsc2' => pr['parusedsc2'],
+          'owntype'    => pr['owntype'],    'ownname'    => pr['ownname'],
+          'gisacres'   => pr['gisacres'],   'siteadd'    => pr['siteadd'],
+          'struct'     => pr['struct']
+        },
         'geometry' => g }
     end
     File.write(pc_file, JSON.generate(
@@ -564,6 +924,7 @@ FEET — both coordinates and heights — and are converted to meters).
 import warnings
 warnings.filterwarnings('ignore')
 import sys
+import os
 import zlib
 import struct
 import numpy as np
@@ -620,13 +981,28 @@ def main():
     crs = None
     xmin = ymin = float('inf')
     xmax = ymax = float('-inf')
+    valid_paths = []
     for p in laz_paths:
-        with laspy.open(p) as f:
-            h = f.header
-            if crs is None:
-                crs = h.parse_crs()
-            xmin = min(xmin, h.x_min); ymin = min(ymin, h.y_min)
-            xmax = max(xmax, h.x_max); ymax = max(ymax, h.y_max)
+        try:
+            with laspy.open(p) as f:
+                h = f.header
+                if crs is None:
+                    crs = h.parse_crs()
+                xmin = min(xmin, h.x_min); ymin = min(ymin, h.y_min)
+                xmax = max(xmax, h.x_max); ymax = max(ymax, h.y_max)
+            valid_paths.append(p)
+        except Exception as ex:
+            print(f"  WARNING: skipping unreadable tile {p.split('/')[-1]}: {ex}", flush=True)
+            try:
+                os.remove(p)   # drop the corrupt cache file so it re-downloads next run
+                print(f"  (removed corrupt cache file; it will re-download next run)", flush=True)
+            except Exception:
+                pass
+    if not valid_paths:
+        print("ERROR: no readable LiDAR tiles (all were corrupt or unreadable). "
+              "Re-run to download fresh copies.", file=sys.stderr, flush=True)
+        sys.exit(2)
+    laz_paths = valid_paths
 
     unit = 1.0
     if crs is not None and crs.axis_info:
@@ -647,7 +1023,17 @@ def main():
     # Loading all tiles at once would need several GB; streaming bounds
     # memory to a single tile's points regardless of how many tiles.
     for p in laz_paths:
-        las = laspy.read(p)
+        try:
+            las = laspy.read(p)
+        except Exception as ex:
+            print(f"  WARNING: skipping tile that failed to read fully "
+                  f"{p.split('/')[-1]}: {ex}", flush=True)
+            try:
+                os.remove(p)
+                print("  (removed corrupt cache file; it will re-download next run)", flush=True)
+            except Exception:
+                pass
+            continue
         x = np.asarray(las.x); y = np.asarray(las.y)
         z = np.asarray(las.z); c = np.asarray(las.classification)
         print(f"  gridded {p.split('/')[-1]}: {len(z):,} points", flush=True)
@@ -959,34 +1345,65 @@ end
 
 def download_file(url, dest, log)
   return if File.exist?(dest)
-  uri = URI(url)
-  3.times do
-    Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == 'https') do |h|
-      h.read_timeout = 600
-      h.request(Net::HTTP::Get.new(uri)) do |res|
-        if %w[301 302 303 307 308].include?(res.code)
-          uri = URI(res['location'])
-          next
-        end
-        raise "download failed: HTTP #{res.code}" unless res.code == '200'
-        total = res['content-length'].to_i
-        done = 0
-        last = 0
-        File.open(dest, 'wb') do |f|
-          res.read_body do |chunk|
-            f.write(chunk)
-            done += chunk.bytesize
-            if done - last > 20_000_000
-              log.("    ...#{(done / 1e6).round} / #{(total / 1e6).round} MB")
-              last = done
+  attempts = 3
+  last_err = nil
+  attempts.times do |attempt|
+    uri = URI(url)
+    tmp = "#{dest}.part"
+    begin
+      redirects = 0
+      loop do
+        done_ok = false
+        Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == 'https') do |h|
+          h.read_timeout = 600
+          h.open_timeout = 60
+          h.request(Net::HTTP::Get.new(uri)) do |res|
+            if %w[301 302 303 307 308].include?(res.code)
+              uri = URI(res['location']); redirects += 1
+              raise 'too many redirects' if redirects > 5
+              next  # re-request the new location
             end
+            raise "HTTP #{res.code}" unless res.code == '200'
+            total = res['content-length'].to_i   # 0 if server didn't say
+            done = 0; last = 0
+            File.open(tmp, 'wb') do |f|
+              res.read_body do |chunk|
+                f.write(chunk); done += chunk.bytesize
+                if done - last > 20_000_000
+                  log.("    ...#{(done / 1e6).round}#{total > 0 ? " / #{(total / 1e6).round}" : ''} MB")
+                  last = done
+                end
+              end
+            end
+            # Verify completeness: if the server told us the size, the file on
+            # disk must match it. A short file means the stream was cut off —
+            # exactly what causes "failed to fill whole buffer" later.
+            actual = File.size(tmp)
+            if total > 0 && actual < total
+              raise "incomplete download (#{actual} of #{total} bytes)"
+            end
+            if actual < 1024
+              raise "download too small (#{actual} bytes) — likely an error page"
+            end
+            done_ok = true
           end
         end
-        return
+        if done_ok
+          File.rename(tmp, dest)   # atomic: only now is it a "good" cached tile
+          return
+        end
+      end
+    rescue => e
+      last_err = e
+      File.delete(tmp) if File.exist?(tmp)   # never leave a partial file behind
+      if attempt < attempts - 1
+        wait = 2 * (attempt + 1)
+        log.("    download attempt #{attempt + 1} failed (#{e.message}); retrying in #{wait}s...")
+        sleep wait
       end
     end
   end
-  raise 'download failed: too many redirects'
+  raise "download failed after #{attempts} attempts: #{last_err&.message}"
 end
 
 def auto_lidar(box, key, log)
@@ -1074,13 +1491,74 @@ def auto_lidar(box, key, log)
             LIDAR_RES_M.to_s, *laz_paths], err: [:child, :out]) do |io|
     io.each_line { |line| log.(line.strip) unless line.strip.empty? }
   end
-  raise 'LiDAR gridding failed — see log lines above.' unless $?.success? && File.exist?(asc)
+  raise 'LiDAR gridding failed — the point-cloud tiles could not be read (see ' \
+        'log above). Corrupt tiles have been cleared; running the scan again will ' \
+        're-download them.' unless $?.success? && File.exist?(asc)
   [asc, []]
 end
 
 # ============================================================================
 # VECTOR PIPELINE (parameterized by cfg from the form)
 # ============================================================================
+def calibrate_only(cfg, log = NOOP_LOG)
+  log.('Pre-calibration: loading address points...')
+  addresses = load_addresses(cfg[:ad_path], cfg[:box])
+  raise 'No address points found in this area. If using OSM auto-fetch: rural OSM ' \
+        'address coverage is often sparse — try a county address file in the manual ' \
+        'fields instead.' if addresses.empty?
+  log.("Addresses loaded: #{addresses.size}")
+  mean_lat = addresses.sum { |_, t| t } / addresses.size
+  mlon = m_lon(mean_lat)
+  log.('Loading building footprints...')
+  rings = load_footprints(cfg[:fp_path], cfg[:box], mlon)
+  log.("Footprints loaded: #{rings.size}")
+
+  # Index addresses with a generous cell so we can measure each building's
+  # nearest address out to a useful distance, not just within the threshold.
+  probe = 75.0
+  aindex = GridIndex.new(probe, mlon)
+  addresses.each { |g, t| aindex.insert(g, t) }
+
+  log.('Measuring nearest-address distance for every building...')
+  dists = []
+  rings.each do |r|
+    area, lng, lat = ring_area_centroid(r, mlon)
+    next if area < cfg[:min_area] || area > cfg[:max_area]
+    best = Float::INFINITY
+    # search outward in rings up to ~5 cells (≈375 m) for a robust nearest
+    (0..5).each do |ring_n|
+      aindex.each_near(lng, lat, ring_n) do |g, t|
+        d = dist_sq(lng, lat, g, t, mlon); best = d if d < best
+      end
+      break if best.finite? && best <= ((ring_n + 1) * probe)**2
+    end
+    dists << Math.sqrt(best) if best.finite?
+  end
+  raise 'Not enough buildings with a measurable nearby address to calibrate ' \
+        '(need at least 5). Try a larger area or a denser address source.' if dists.size < 5
+
+  s_all = dists.sort
+  # The full distribution includes buildings with no real nearby address (common
+  # where address data is sparse). For the THRESHOLD recommendation, look only at
+  # buildings whose nearest address is plausibly their own — within 100 m — since
+  # those are the ones that are actually registered. The histogram still shows the
+  # whole picture.
+  registered = s_all.select { |d| d <= 100.0 }
+  basis = registered.size >= 5 ? registered : s_all
+  pct = ->(arr, p) { arr[[(p * (arr.size - 1) / 100.0).round, arr.size - 1].min] }
+  # histogram over the full set, 10 m bands up to 100 m, then 100 m+
+  bands = Array.new(11, 0)
+  s_all.each { |d| bands[[(d / 10).floor, 10].min] += 1 }
+  log.("Pre-calibration complete: #{s_all.size} buildings measured " \
+       "(#{registered.size} with an address within 100 m).")
+  {
+    n: s_all.size, n_registered: registered.size,
+    p50: pct.call(basis, 50).round(1), p90: pct.call(basis, 90).round(1),
+    p95: pct.call(basis, 95).round(1), p99: pct.call(basis, 99).round(1),
+    max: basis.last.round(1), threshold: cfg[:threshold].to_i, bands: bands
+  }
+end
+
 def run_vector(cfg, log = NOOP_LOG)
   log.('Loading address points...')
   addresses = load_addresses(cfg[:ad_path], cfg[:box])
@@ -1103,6 +1581,9 @@ def run_vector(cfg, log = NOOP_LOG)
     pindex = ParcelIndex.new(200.0, mlon)
     parcels.each { |r, imp| pindex.insert(r, imp) }
   end
+
+  zones = cfg[:zones]   # OSM industrial/railway zones, if fetched
+  dismissed = load_dismissed
 
   aindex = GridIndex.new(cfg[:threshold], mlon)
   addresses.each { |g, t| aindex.insert(g, t) }
@@ -1142,7 +1623,12 @@ def run_vector(cfg, log = NOOP_LOG)
     nearest_m = nearest == Float::INFINITY ? nil : Math.sqrt(nearest)
 
     pr = pindex&.lookup(lng, lat)
-    improvement = pr.nil? ? 'no_parcel' : (pr[1].nil? ? 'field_missing' : pr[1].round)
+    pctx = pr && pr[1].is_a?(Hash) ? pr[1] : nil
+    imp_val = if pctx then pctx[:imp]
+              elsif pr then (pr[1].is_a?(Numeric) ? pr[1] : nil)
+              else :no_parcel end
+    improvement = pr.nil? ? 'no_parcel' : (imp_val.nil? ? 'field_missing' : imp_val.round)
+    use_flag = parcel_use_flag(pctx)   # non-residential use description, or nil
 
     nbrs = 0
     dindex.each_near(lng, lat) do |g, t|
@@ -1166,26 +1652,75 @@ def run_vector(cfg, log = NOOP_LOG)
       next if nearest_struct < clear_sq
     end
 
+    # Building-cluster signal: how many other footprints sit within the cluster
+    # radius. A lone structure scores ~0; an industrial park or rail yard is
+    # surrounded by many. Used to flag (and optionally reject) clustered sites.
+    crad = cfg[:cluster_radius] || 150.0
+    crad_sq = crad**2
+    crings = (crad / dindex_cell).ceil + 1
+    cluster_n = 0
+    dindex.each_near(lng, lat, crings) do |g, t|
+      d = dist_sq(lng, lat, g, t, mlon)
+      cluster_n += 1 if d <= crad_sq && d > 0.25
+    end
+    next if cfg[:max_cluster] && cluster_n > cfg[:max_cluster]
+
+    # OSM industrial / railway zone membership (if those layers were fetched)
+    in_zone = zone_hit(zones, lng, lat) if zones
+    next if cfg[:reject_zones] && in_zone
+
     s_iso = nearest_m ? [nearest_m / cfg[:max_search], 1.0].min : 1.0
-    s_par = pr.nil? ? 0.5 : (pr[1].nil? ? 0.5 : (pr[1] <= 0 ? 1.0 : 0.0))
+    s_par = imp_val.is_a?(Numeric) ? (imp_val <= 0 ? 1.0 : 0.0) : 0.5
     s_den = [(10 - nbrs) / 10.0, 0.0].max
     score = 0.40 * s_iso + 0.35 * s_par + 0.25 * s_den
+    # context penalties: industrial use, dense cluster, or zone membership all
+    # make a "hidden structure" far less likely — push these down the ranking
+    score -= 0.25 if use_flag
+    score -= 0.20 if in_zone
+    score -= [cluster_n * 0.02, 0.20].min
+    score = 0.0 if score < 0
+
 
     ring_m = ring.map { |g, t| [(g - ring[0][0]) * mlon, (t - ring[0][1]) * M_LAT] }
     perim = 0.0
     ring_m.each_cons(2) { |(x1, y1), (x2, y2)| perim += Math.hypot(x2 - x1, y2 - y1) }
     shp = shape_descriptors(ring_m, area, perim)
     tank = lone_circle?(shp)
+    cls = classify_footprint(ring_m, area, perim)
+    glyph = shape_glyph_svg(ring_m, cls[:long], cls[:short])
+
+    # Build a short "accuracy notes" string summarizing context signals so the
+    # user can judge each hit. Positive signals (isolated, no improvement value)
+    # and warning signals (industrial use, cluster, zone) both surface here.
+    notes = []
+    notes << "use: #{use_flag}" if use_flag
+    notes << "in #{in_zone}" if in_zone
+    notes << "#{cluster_n} bldgs within #{crad.to_i}m" if cluster_n >= 3
+    notes << 'big parcel' if pctx && pctx[:acres].to_f >= 20
+    notes << "owner: #{pctx[:owner_type]}" if pctx && !pctx[:owner_type].empty? &&
+                                              pctx[:owner_type].upcase !~ /\A(PRIV|INDIV|PERSON)/
+    flagged = !(use_flag.nil? && in_zone.nil?) || cluster_n >= 5
+    dm = dismissed_match(dismissed, lat, lng)
 
     out << { lat: lat.round(6), lng: lng.round(6), area_m2: area.round(1),
              nearest_address_m: nearest_m ? nearest_m.round(1) : ">#{cfg[:max_search].to_i}",
              parcel_improvement: improvement, neighbors_200m: nbrs,
+             cluster_n: cluster_n,
+             use_desc: (pctx && !pctx[:use_desc].empty? ? pctx[:use_desc] : ''),
+             site_addr: (pctx ? pctx[:site_addr] : ''),
+             notes: notes.join(' · '),
+             flagged: flagged,
+             dismissed: !dm.nil?, dismiss_reason: (dm ? dm[:reason].to_s : ''),
              shape: shp ? "circ #{shp[:circularity].round(2)}" : 'n/a',
+             shape_class: cls[:shape], likely_type: cls[:type],
+             dim: (cls[:long] && cls[:short] ? "#{cls[:long].round}×#{cls[:short].round}m" : ''),
+             glyph: glyph,
              tank: tank,
              score: score.round(3) }
   end
 
   out.reject! { |c| c[:tank] } if cfg[:hide_tanks]
+  out.reject! { |c| c[:dismissed] } if cfg[:hide_dismissed]
   if cfg[:max_neighbors]
     log.("Neighbor filter: keeping only candidates with <= #{cfg[:max_neighbors]} " \
          "neighbor(s) within #{cfg[:neighbor_radius].to_i}m")
@@ -1194,8 +1729,10 @@ def run_vector(cfg, log = NOOP_LOG)
     log.("Clearance filter: keeping only targets with no other building " \
          "within #{cfg[:clear_dist].to_i}m")
   end
+  ndis = out.count { |c| c[:dismissed] }
+  log.("Skipping #{ndis} dismissed location#{ndis == 1 ? '' : 's'}") if ndis > 0
   log.("Join complete: #{out.size} candidates")
-  out.sort_by! { |c| [c[:tank] ? 1 : 0, -c[:score]] }
+  out.sort_by! { |c| [c[:dismissed] ? 1 : 0, c[:tank] ? 1 : 0, -c[:score]] }
   write_outputs(out, 'candidates')
 
   # Calibration: where do registered buildings' nearest-address distances fall?
@@ -1248,6 +1785,7 @@ def run_lidar(cfg, suppress, log = NOOP_LOG)
   cell_area = (grid[:cell] * M_LAT) * (grid[:cell] * mlon)
 
   visited = Array.new(ncols * nrows, false)
+  dismissed = load_dismissed
   blobs = []
   (0...nrows).each do |row|
     (0...ncols).each do |col|
@@ -1303,15 +1841,27 @@ def run_lidar(cfg, suppress, log = NOOP_LOG)
     end
     shp = shape_descriptors(pts_m, area, perim)
     tank = lone_circle?(shp)
+    dm = dismissed_match(dismissed, lat, lng)
+    cls = classify_footprint(pts_m, area, perim)
+    # refine the type with roof form from the height data, and keep the roof label
+    refined_type, roof = refine_type_with_roof(cls, area, mean, rough)
+    # LiDAR blobs are a set of grid cells, not an ordered ring — draw the convex
+    # hull outline so the glyph still reads as a clean shape.
+    glyph = shape_glyph_svg(convex_hull(pts_m), cls[:long], cls[:short])
 
     out << { lat: lat.round(6), lng: lng.round(6), area_m2: area.round(1),
              mean_height_m: mean.round(2), roughness_m: rough.round(2),
              shape: shp ? "circ #{shp[:circularity].round(2)}" : 'n/a',
+             shape_class: cls[:shape], likely_type: refined_type, roof: roof,
+             dim: (cls[:long] && cls[:short] ? "#{cls[:long].round}×#{cls[:short].round}m" : ''),
+             glyph: glyph,
+             dismissed: !dm.nil?, dismiss_reason: (dm ? dm[:reason].to_s : ''),
              tank: tank }
   end
   out.reject! { |c| c[:tank] } if cfg[:hide_tanks]
+  out.reject! { |c| c[:dismissed] } if cfg[:hide_dismissed]
   log.("LiDAR complete: #{out.size} flat elevated blobs unknown to footprints")
-  out.sort_by! { |c| [c[:tank] ? 1 : 0, c[:roughness_m]] }
+  out.sort_by! { |c| [c[:dismissed] ? 1 : 0, c[:tank] ? 1 : 0, c[:roughness_m]] }
   write_outputs(out, 'lidar_candidates')
   out
 end
@@ -1468,6 +2018,62 @@ PICKER_JS = <<~'JS'
       if (e.key === 'Enter') { e.preventDefault(); doFind(); }
     });
   })();
+
+  // ---- Dismiss / restore candidates (persist across runs) ----
+  function postForm(url, data) {
+    var body = Object.keys(data).map(function (k) {
+      return encodeURIComponent(k) + '=' + encodeURIComponent(data[k]);
+    }).join('&');
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body
+    });
+  }
+  function rowFade(row, on) {
+    row.querySelectorAll('td').forEach(function (td) {
+      if (!td.classList.contains('actcell')) td.style.opacity = on ? '.42' : '';
+    });
+  }
+  window.dismissCand = function (btn) {
+    var row = btn.closest('tr');
+    var lat = row.getAttribute('data-lat'), lng = row.getAttribute('data-lng');
+    var reason = window.prompt(
+      'Skip this location on future scans.\nOptional note (e.g. "occupied", "active business") — or leave blank:', '');
+    if (reason === null) return; // cancelled
+    btn.disabled = true; btn.textContent = '…';
+    postForm('/dismiss', { lat: lat, lng: lng, reason: reason }).then(function () {
+      row.classList.add('disrow'); rowFade(row, true);
+      var notes = row.querySelector('.notes-cell');
+      if (notes) notes.innerHTML = "<span class='distag'>dismissed" +
+        (reason ? ': ' + reason.replace(/[<>&]/g, '') : '') + "</span>";
+      btn.outerHTML = "<button type='button' class='dismiss-btn restore' onclick='undismiss(this)'>restore</button>";
+    }).catch(function () { btn.disabled = false; btn.textContent = 'dismiss'; });
+  };
+  window.undismiss = function (btn) {
+    var row = btn.closest('tr');
+    var lat = row.getAttribute('data-lat'), lng = row.getAttribute('data-lng');
+    btn.disabled = true; btn.textContent = '…';
+    postForm('/undismiss', { lat: lat, lng: lng }).then(function () {
+      row.classList.remove('disrow'); rowFade(row, false);
+      btn.outerHTML = "<button type='button' class='dismiss-btn' onclick='dismissCand(this)'>dismiss</button>";
+    }).catch(function () { btn.disabled = false; btn.textContent = 'restore'; });
+  };
+  window.undismissPanel = function (btn) {
+    var row = btn.closest('tr');
+    var lat = row.getAttribute('data-lat'), lng = row.getAttribute('data-lng');
+    btn.disabled = true; btn.textContent = '…';
+    postForm('/undismiss', { lat: lat, lng: lng }).then(function () {
+      row.parentNode.removeChild(row);
+    }).catch(function () { btn.disabled = false; btn.textContent = 'restore'; });
+  };
+  window.clearExamined = function (btn) {
+    btn.disabled = true; btn.textContent = '…';
+    postForm('/examined/clear', {}).then(function () {
+      btn.closest('fieldset').style.opacity = '.5';
+      btn.textContent = 'sweep reset \u2713';
+    }).catch(function () { btn.disabled = false; btn.textContent = 'Reset sweep progress'; });
+  };
   </script>
 JS
 
@@ -1516,6 +2122,9 @@ VIEWER_JS = <<~'JS'
       if (zout) zout.addEventListener('click', function () { step(1 / 1.15); });
     })();
     w.addEventListener('pointerdown', function (e) {
+      // If the tap landed on a candidate marker bubble, let it handle its own
+      // click (highlight the row) instead of capturing the pointer for panning.
+      if (e.target.closest && e.target.closest('.mkbub')) return;
       ptrs[e.pointerId] = e; w.setPointerCapture(e.pointerId);
       moved = 0; sx = e.clientX; sy = e.clientY; stx = tx; sty = ty;
       var ids = Object.keys(ptrs);
@@ -1705,10 +2314,33 @@ VIEWER_JS = <<~'JS'
 
     var t = null;
     function schedule() { clearTimeout(t); t = setTimeout(render, 30); }
+
+    // position the custom fill + thumb to match the input's value. Because they
+    // move in percent across the full track, they reach 0% and 100% exactly —
+    // the thumb sits flush at both ends with no native inset.
+    function paintRange(el) {
+      var min = +el.min, max = +el.max, val = +el.value;
+      var pct = max > min ? (val - min) / (max - min) * 100 : 0;
+      var sl = el.closest('.sl');
+      if (!sl) return;
+      var fill = sl.querySelector('.sl-fill'), thumb = sl.querySelector('.sl-thumb');
+      if (fill) fill.style.width = pct + '%';
+      if (thumb) thumb.style.left = pct + '%';
+    }
+    function updateReadouts() {
+      var azEl = bar.querySelector('.r-az'), zEl = bar.querySelector('.r-z');
+      var azV = bar.querySelector('.r-az-v'), zV = bar.querySelector('.r-z-v');
+      if (azEl && azV) azV.textContent = Math.round(+azEl.value) + '\u00b0';
+      if (zEl && zV) zV.textContent = (+zEl.value).toFixed(1) + '\u00d7';
+      if (azEl) paintRange(azEl);
+      if (zEl) paintRange(zEl);
+    }
+
     bar.querySelectorAll('input,select').forEach(function (el) {
-      el.addEventListener('input', schedule);
-      el.addEventListener('change', schedule);
+      el.addEventListener('input', function () { updateReadouts(); schedule(); });
+      el.addEventListener('change', function () { updateReadouts(); schedule(); });
     });
+    updateReadouts();   // set initial fill + readout immediately
   });
 
   // ===== Bidirectional link: marker <-> table row =====
@@ -1823,7 +2455,8 @@ PAGE_HEAD = <<~'HTML'
                border:1px solid var(--steel-line); border-radius:4px;
                box-shadow:0 1px 2px rgba(0,0,0,.5); }
       .row { display:flex; flex-wrap:wrap; gap:12px; }
-      .f { display:flex; flex-direction:column; gap:3px; flex:1; min-width:130px; }
+      .f { display:flex; flex-direction:column; gap:3px;
+           flex:1 1 120px; min-width:110px; max-width:100%; }
       .lbl { font-size:11px; letter-spacing:.1em; text-transform:uppercase;
              color:var(--amber); }
       input, select { font:inherit; padding:8px 10px;
@@ -1856,10 +2489,54 @@ PAGE_HEAD = <<~'HTML'
       tr:nth-child(even) td { background:rgba(255,255,255,.02); }
       td.sc { font-weight:700; color:var(--signal); }
       tr.tankrow { opacity:0.5; font-style:italic; }
+      tr.flagrow td { background:rgba(255,106,43,.08); }
+      tr.flagrow .notes-cell { color:var(--flag); }
+      tr.disrow td { opacity:.42; }
+      tr.disrow .actcell { opacity:1; }
+      .distag { color:var(--ink-dim); font-style:italic; font-size:11.5px; }
+      .actcell { text-align:center; white-space:nowrap; }
+      .dismiss-btn {
+        font:inherit; font-size:10.5px; letter-spacing:.08em; text-transform:uppercase;
+        color:var(--ink-dim); background:linear-gradient(180deg,var(--steel-3),var(--steel-2));
+        border:1px solid var(--line); border-radius:5px; padding:4px 9px; cursor:pointer;
+      }
+      .dismiss-btn:hover { color:var(--flag); border-color:var(--flag); }
+      .dismiss-btn.restore:hover { color:var(--signal); border-color:var(--signal); }
+      .notes-cell { font-size:11.5px; color:var(--ink-dim); max-width:240px; }
+      .shapecell { display:flex; align-items:center; gap:9px; min-width:170px; }
+      .shapecell .glyph { flex:0 0 auto; background:#11141a; border:1px solid var(--line);
+                          border-radius:5px; }
+      .shapetxt { display:flex; flex-direction:column; line-height:1.25; font-size:11.5px; }
+      .shapetxt b { color:var(--ink); font-weight:700; letter-spacing:.02em; }
+      .shapetxt .dim { color:var(--signal); font-variant-numeric:tabular-nums; font-size:10.5px; }
+      .shapetxt .ltype { color:var(--amber); font-size:10.5px; }
+      .shapetxt .roof { color:#7fc7ff; font-size:10px; font-style:italic; }
+      /* collapsible panels: hidden until the summary is clicked */
+      details.collapse > summary {
+        cursor:pointer; list-style:none; user-select:none;
+        font-size:11.5px; letter-spacing:.08em; color:var(--amber);
+        padding:7px 11px; border:1px solid var(--line); border-radius:6px;
+        background:linear-gradient(180deg,var(--steel-3),var(--steel-2));
+        display:inline-flex; align-items:center; gap:8px;
+      }
+      details.collapse > summary::-webkit-details-marker { display:none; }
+      details.collapse > summary::before { content:"▸"; color:var(--amber); font-size:10px; }
+      details.collapse[open] > summary::before { content:"▾"; }
+      details.collapse > summary:hover { border-color:var(--amber); }
       .calib { background:rgba(70,211,154,.07); border:1px solid var(--signal);
                border-radius:5px; padding:10px 13px; margin:8px 0 12px;
                font-size:12px; line-height:1.5; color:var(--ink); }
       .calib strong { color:var(--signal); }
+      .hbars { margin:10px 0 4px; font-size:11.5px; }
+      .hbar-cap { font-size:11.5px; color:var(--ink-dim); margin:10px 0 4px; }
+      .hbar-row { display:flex; align-items:center; gap:8px; margin:3px 0; }
+      .hbar-lbl { width:62px; text-align:right; color:var(--ink-dim);
+                  font-variant-numeric:tabular-nums; }
+      .hbar-track { flex:1; height:14px; background:#11141a;
+                    border:1px solid var(--steel-line); border-radius:3px; overflow:hidden; }
+      .hbar-fill { display:block; height:100%;
+                   background:linear-gradient(90deg, #cf8c1e, var(--amber)); }
+      .hbar-n { width:34px; color:var(--signal); font-variant-numeric:tabular-nums; }
       a { color:var(--amber); }
       .stat { font-size:12px; color:var(--ink-dim); margin:6px 0 10px; }
       .err { border:1px solid var(--flag); border-radius:5px;
@@ -1880,7 +2557,33 @@ PAGE_HEAD = <<~'HTML'
                    padding:7px 10px; font-size:11px;
                    text-transform:uppercase; letter-spacing:.06em; color:var(--ink); }
       .reliefbar label { display:flex; align-items:center; gap:5px; }
-      .reliefbar input[type=range] { width:90px; }
+      /* Custom slider: a track with a fill and thumb that I position by percent
+         (so they reach 0% and 100% exactly), with the real range input laid
+         transparent on top to handle all the interaction. No native-thumb inset
+         quirks — the thumb sits flush at both ends. */
+      .reliefbar .sl { position:relative; display:inline-block; width:96px; height:16px;
+                       vertical-align:middle; }
+      .reliefbar .sl-track { position:absolute; left:0; right:0; top:50%;
+                             transform:translateY(-50%); height:5px; border-radius:3px;
+                             background:#11141a; border:1px solid var(--line); overflow:hidden; }
+      .reliefbar .sl-fill { position:absolute; left:0; top:0; bottom:0; width:0;
+                            background:linear-gradient(90deg,var(--amber-deep,#cf8c1e),var(--amber)); }
+      .reliefbar .sl-thumb { position:absolute; top:50%; left:0;
+                             width:13px; height:13px; border-radius:50%;
+                             transform:translate(-50%,-50%);
+                             background:var(--amber); border:1px solid #1c1f25;
+                             box-shadow:0 1px 2px rgba(0,0,0,.55); pointer-events:none; }
+      .reliefbar .sl-input {
+        -webkit-appearance:none; appearance:none; position:absolute; inset:0;
+        width:100%; height:100%; margin:0; background:transparent; cursor:pointer; opacity:0;
+      }
+      .reliefbar .sl-input::-webkit-slider-thumb {
+        -webkit-appearance:none; appearance:none; width:16px; height:16px;
+      }
+      .reliefbar .sl-input::-moz-range-thumb { width:16px; height:16px; border:0; }
+      .reliefbar .rwrap { display:inline-flex; align-items:center; gap:6px; }
+      .reliefbar .rval { font-variant-numeric:tabular-nums; color:var(--signal);
+                         min-width:30px; text-align:right; font-size:10.5px; }
       .reliefbar select { width:auto; padding:2px 4px; font-size:11px; }
       .r-live { margin-left:auto; color:var(--flag); font-weight:700; }
       .r-zoom { display:inline-flex; gap:4px; }
@@ -1954,8 +2657,8 @@ PAGE_HEAD = <<~'HTML'
 
     <header>
       <h1>Structure Hunter <span class="quad">// survey console</span></h1>
-      <div class="tagline">(Finding hidden, forgotten or unknown // pre-existing abandoned structures)</div>
-      <div style="text-align:center;font-size:10px;color:var(--ink-dim);letter-spacing:.1em;margin-top:2px">build v34-glow-match</div>
+      <div class="tagline">(Finding hidden, forgotten or otherwise known or unknown abandoned structures)</div>
+      <div style="text-align:center;font-size:10px;color:var(--ink-dim);letter-spacing:.1em;margin-top:2px">build v47-roof-shape</div>
       <div style="text-align:center;margin-top:8px">
         <button type="button" class="mkbtn" id="aboutbtn" style="width:auto;display:inline-block">About this instrument</button>
         <button type="button" class="mkbtn" id="howsearchbtn" style="width:auto;display:inline-block;margin-left:6px">How to: search &amp; tune</button>
@@ -2221,6 +2924,44 @@ PAGE_HEAD = <<~'HTML'
 HTML
 
 
+def examined_panel_html
+  list = load_examined
+  return '' if list.empty?
+  <<~HTML
+    <fieldset style="margin-top:26px"><legend>LiDAR sweep progress</legend>
+      <div class="note" style="margin-bottom:8px">You've examined <strong>#{list.size}</strong>
+      LiDAR window#{list.size == 1 ? '' : 's'} in big-area scans. With focus set to
+      <em>"Next unexamined"</em>, each run advances to the next candidate you haven't looked at yet,
+      sweeping the area over repeated scans. Reset to start the sweep over.</div>
+      <button type="button" class="dismiss-btn" onclick="clearExamined(this)">Reset sweep progress</button>
+    </fieldset>
+  HTML
+end
+
+def dismissed_panel_html
+  list = load_dismissed
+  return '' if list.empty?
+  rows = list.sort_by { |d| d[:at].to_s }.reverse.map do |d|
+    link = "https://maps.google.com/?q=#{d[:lat]},#{d[:lng]}"
+    reason = d[:reason].to_s.empty? ? '<span style="color:var(--ink-dim)">—</span>' : esc(d[:reason])
+    "<tr data-lat=\"#{d[:lat]}\" data-lng=\"#{d[:lng]}\">" \
+      "<td><a href=\"#{link}\" target=\"_blank\">#{d[:lat]}, #{d[:lng]}</a></td>" \
+      "<td>#{reason}</td><td>#{d[:at]}</td>" \
+      "<td class=\"actcell\"><button type=\"button\" class=\"dismiss-btn restore\" onclick=\"undismissPanel(this)\">restore</button></td></tr>"
+  end.join
+  <<~HTML
+    <fieldset style="margin-top:26px"><legend>Dismissed locations (#{list.size})</legend>
+      <details class="collapse">
+        <summary>Show / manage #{list.size} dismissed location#{list.size == 1 ? '' : 's'}</summary>
+        <div class="note" style="margin:10px 0">Locations you've marked to skip on future scans.
+        They're matched within ~20&nbsp;m, so they stay skipped even if coordinates shift slightly.
+        Restore any to let it appear in results again. (These survive clearing the cache.)</div>
+        <table><tr><th>Location</th><th>Note</th><th>Dismissed</th><th></th></tr>#{rows}</table>
+      </details>
+    </fieldset>
+  HTML
+end
+
 def cache_panel_html
   s = cache_stats
   rows = s[:groups].sort_by { |_, v| -v[:bytes] }.map do |kind, v|
@@ -2330,7 +3071,36 @@ def form_html(p)
                 'blank = off · require no other building within this many meters of the target')}
         #{field('Neighbor radius (m)', 'neighbor_radius', p['neighbor_radius'],
                 'count neighbors within this distance (default 200)')}
+        #{field('Max building cluster', 'max_cluster', p['max_cluster'],
+                'blank = off · reject if more than this many buildings sit within the cluster radius (drops industrial parks &amp; rail yards)')}
+        #{field('Cluster radius (m)', 'cluster_radius', p['cluster_radius'],
+                'how wide to count the building cluster (default 150)')}
       </div>
+    </fieldset>
+
+    <fieldset><legend>Context &amp; accuracy (optional)</legend>
+      <label class="chk">
+        <input type="checkbox" name="use_zones" #{p['use_zones'] == 'on' ? 'checked' : ''}>
+        <span><strong>Check OpenStreetMap industrial &amp; railway zones.</strong> Fetches
+        industrial / commercial / quarry land-use, rail yards, airports, and rail lines for
+        the area, and notes when a candidate sits inside one. Adds an OSM fetch (cached after
+        the first run). Great for ruling out warehouses and train yards.</span>
+      </label>
+      <label class="chk" style="margin-bottom:0">
+        <input type="checkbox" name="reject_zones" #{p['reject_zones'] == 'on' ? 'checked' : ''}>
+        <span><strong>Reject candidates inside those zones entirely</strong> (default: keep them,
+        flagged and pushed down the ranking). Only takes effect with the box above ticked.</span>
+      </label>
+      <div class="note" style="margin-top:10px">With NC OneMap parcels, each candidate also shows
+      its <strong>tax use</strong> (e.g. SFR, COMMERCIAL), <strong>site address</strong>, and a
+      <strong>notes</strong> column summarizing accuracy signals — industrial use, building clusters,
+      large parcels, and non-individual owners are flagged automatically.</div>
+      <label class="chk" style="margin:12px 0 0">
+        <input type="checkbox" name="hide_dismissed" #{p['hide_dismissed'] == 'on' ? 'checked' : ''}>
+        <span><strong>Hide dismissed locations entirely.</strong> When you mark a result "dismiss"
+        it's skipped on future scans. By default dismissed results still appear, greyed out at the
+        bottom (so you can restore them); tick this to drop them from the list completely.</span>
+      </label>
     </fieldset>
 
     <fieldset><legend>LiDAR refine (optional)</legend>
@@ -2346,9 +3116,24 @@ def form_html(p)
         no big downloads (terrain &amp; ghost features only, no height map ·
         needs: pip install rasterio)
       </label>
+      <label class="f" style="width:100%;margin-top:4px">
+        <span class="lbl">LiDAR focus (when the area is too big to scan whole)</span>
+        <select name="lidar_focus">
+          <option value="top1" #{(p['lidar_focus'] || 'top1') == 'top1' ? 'selected' : ''}>Top candidate only (one window — fastest)</option>
+          <option value="top3" #{p['lidar_focus'] == 'top3' ? 'selected' : ''}>Top 3 candidates (three windows — covers more leads)</option>
+          <option value="next" #{p['lidar_focus'] == 'next' ? 'selected' : ''}>Next unexamined (sweeps forward each run — pairs with dismiss)</option>
+          <option value="pick2" #{p['lidar_focus'] == 'pick2' ? 'selected' : ''}>Candidate #2 only</option>
+          <option value="pick3" #{p['lidar_focus'] == 'pick3' ? 'selected' : ''}>Candidate #3 only</option>
+          <option value="pick4" #{p['lidar_focus'] == 'pick4' ? 'selected' : ''}>Candidate #4 only</option>
+          <option value="pick5" #{p['lidar_focus'] == 'pick5' ? 'selected' : ''}>Candidate #5 only</option>
+        </select>
+        <span class="hint">A county-sized area can't be LiDAR-scanned whole, so the tool focuses ~2&nbsp;km windows. This picks which candidate(s) to examine — so #2, #3 and beyond aren't ignored. "Next unexamined" remembers what you've already looked at and advances to the next lead each run, sweeping the whole area over repeated scans.</span>
+      </label>
       <div class="row">
         #{field('nDSM grid (.asc)', 'ndsm_path', p['ndsm_path'],
                 'leave blank to skip · see prepare_lidar.sh to make one', '100%')}
+      </div>
+      <div class="row" style="margin-top:12px">
         #{field('Min height (m)', 'l_minh', p['l_minh'], 'below = bushes, cars')}
         #{field('Max height (m)', 'l_maxh', p['l_maxh'], 'above = tall trees')}
         #{field('Max roughness (m)', 'l_rough', p['l_rough'],
@@ -2376,8 +3161,61 @@ def form_html(p)
       </div>
     </fieldset>
 
+    <fieldset><legend>Pre-calibration (optional)</legend>
+      <label class="chk" style="margin-bottom:0">
+        <input type="checkbox" name="calibrate_only" #{p['calibrate_only'] == 'on' ? 'checked' : ''}>
+        <span><strong>Calibrate first, don't scan yet.</strong> Runs a fast pass that measures
+        how far registered buildings sit from their address in this area, shows the distribution
+        as a histogram, and recommends an Address distance — without downloading LiDAR or scoring
+        candidates. Use it to set the threshold from real data, then uncheck and run the full scan.</span>
+      </label>
+    </fieldset>
+
     <button type="submit">Run scan</button>
     </form>
+  HTML
+end
+
+def calib_histogram(bands)
+  return '' unless bands && bands.any?
+  mx = [bands.max, 1].max
+  labels = ['0–10', '10–20', '20–30', '30–40', '40–50',
+            '50–60', '60–70', '70–80', '80–90', '90–100', '100 m+']
+  rows = bands.each_with_index.map do |count, i|
+    pct = (count.to_f / mx * 100).round
+    "<div class=\"hbar-row\">" \
+      "<span class=\"hbar-lbl\">#{labels[i]}</span>" \
+      "<span class=\"hbar-track\"><span class=\"hbar-fill\" style=\"width:#{pct}%\"></span></span>" \
+      "<span class=\"hbar-n\">#{count}</span>" \
+    "</div>"
+  end.join
+  "<div class=\"hbars\">#{rows}</div>"
+end
+
+def calibrate_panel_html(c)
+  return '' unless c
+  rec = c[:p95].ceil
+  <<~HTML
+    <fieldset><legend>Pre-calibration result</legend>
+      <div class="calib">
+        <strong>Measured #{c[:n]} buildings</strong> — no candidate scan was run. Of those,
+        <strong>#{c[:n_registered]}</strong> have an address point within 100 m (the plausibly
+        registered ones). Among that registered group, the distances to their nearest address are:
+        half within <strong>#{c[:p50].round} m</strong>,
+        90% within <strong>#{c[:p90].round} m</strong>,
+        95% within <strong>#{c[:p95].round} m</strong>,
+        99% within #{c[:p99].round} m.
+      </div>
+      <div class="hbar-cap">Nearest-address distance — all #{c[:n]} buildings (bands of 10 m):</div>
+      #{calib_histogram(c[:bands])}
+      <div class="calib" style="margin-top:12px">
+        <strong>Recommended Address distance: #{rec} m</strong> (95th percentile of the registered
+        group). Set the Address distance field near this, then run a full scan: it will treat as
+        registered nearly every building that truly has an address, and flag the rest as candidates.
+        Lower it for a stricter search, raise it if real houses slip through. Current setting: #{c[:threshold]} m.
+        #{c[:n_registered] < 5 ? '<br><em>Note: very few buildings here have a nearby address (sparse data), so this estimate is rough — sparse address coverage is itself a sign this is good hunting ground.</em>' : ''}
+      </div>
+    </fieldset>
   HTML
 end
 
@@ -2400,6 +3238,11 @@ def calib_html(c)
 end
 
 def results_html(result, lidar_result, source, lidar_help, lidar_imgs = [], geo_box = nil)
+  # Pre-calibration mode: show only the calibration panel, no candidate tables.
+  if result.is_a?(Hash) && result[:calibrate_only]
+    return "<div class=\"stat\" style=\"margin-top:20px\">#{source ? "data: #{esc(source)}" : ''}</div>" +
+           calibrate_panel_html(result[:calib])
+  end
   markers = ''
   if geo_box
     bw = geo_box[2] - geo_box[0]
@@ -2431,11 +3274,14 @@ def results_html(result, lidar_result, source, lidar_help, lidar_imgs = [], geo_
     result[:candidates].first(100).each_with_index do |c, idx|
       link = "https://maps.google.com/?q=#{c[:lat]},#{c[:lng]}"
       vec_rows << <<~R
-        <tr id="row-v#{idx + 1}" data-mk="v#{idx + 1}" class="candrow#{c[:tank] ? ' tankrow' : ''}"><td class="rk">#{idx + 1}</td><td class="sc">#{c[:score]}</td><td>#{c[:area_m2]}</td>
+        <tr id="row-v#{idx + 1}" data-mk="v#{idx + 1}" data-lat="#{c[:lat]}" data-lng="#{c[:lng]}" class="candrow#{c[:tank] ? ' tankrow' : ''}#{c[:flagged] ? ' flagrow' : ''}#{c[:dismissed] ? ' disrow' : ''}"><td class="rk">#{idx + 1}</td><td class="sc">#{c[:score]}</td><td>#{c[:area_m2]}</td>
         <td>#{c[:nearest_address_m]}</td><td>#{c[:parcel_improvement]}</td>
         <td>#{c[:neighbors_200m]}</td>
-        <td>#{c[:tank] ? 'tank-like ⭕' : c[:shape]}</td>
-        <td><a href="#{link}" target="_blank">#{c[:lat]}, #{c[:lng]}</a></td></tr>
+        <td>#{esc(c[:use_desc].to_s)}</td>
+        <td class="shapecell">#{c[:glyph]}<span class="shapetxt"><b>#{c[:tank] ? 'tank / silo' : esc(c[:shape_class].to_s)}</b>#{c[:dim].to_s.empty? ? '' : "<span class='dim'>#{c[:dim]}</span>"}<span class='ltype'>#{c[:tank] ? '' : esc(c[:likely_type].to_s)}</span></span></td>
+        <td class="notes-cell">#{c[:dismissed] ? "<span class='distag'>dismissed#{c[:dismiss_reason].to_s.empty? ? '' : ": #{esc(c[:dismiss_reason])}"}</span>" : esc(c[:notes].to_s)}</td>
+        <td><a href="#{link}" target="_blank">#{c[:lat]}, #{c[:lng]}</a></td>
+        <td class="actcell">#{c[:dismissed] ? "<button type='button' class='dismiss-btn restore' onclick='undismiss(this)'>restore</button>" : "<button type='button' class='dismiss-btn' onclick='dismissCand(this)'>dismiss</button>"}</td></tr>
       R
     end
   end
@@ -2444,10 +3290,11 @@ def results_html(result, lidar_result, source, lidar_help, lidar_imgs = [], geo_
     lidar_result.first(100).each_with_index do |c, idx|
       link = "https://maps.google.com/?q=#{c[:lat]},#{c[:lng]}"
       lid_rows << <<~R
-        <tr id="row-l#{idx + 1}" data-mk="l#{idx + 1}" class="candrow#{c[:tank] ? ' tankrow' : ''}"><td class="rk">L#{idx + 1}</td><td class="sc">#{c[:roughness_m]}</td><td>#{c[:area_m2]}</td>
+        <tr id="row-l#{idx + 1}" data-mk="l#{idx + 1}" data-lat="#{c[:lat]}" data-lng="#{c[:lng]}" class="candrow#{c[:tank] ? ' tankrow' : ''}#{c[:dismissed] ? ' disrow' : ''}"><td class="rk">L#{idx + 1}</td><td class="sc">#{c[:roughness_m]}</td><td>#{c[:area_m2]}</td>
         <td>#{c[:mean_height_m]}</td>
-        <td>#{c[:tank] ? 'tank-like ⭕' : c[:shape]}</td>
-        <td><a href="#{link}" target="_blank">#{c[:lat]}, #{c[:lng]}</a></td></tr>
+        <td class="shapecell">#{c[:dismissed] ? "<span class='distag'>dismissed#{c[:dismiss_reason].to_s.empty? ? '' : ": #{esc(c[:dismiss_reason])}"}</span>" : "#{c[:glyph]}<span class='shapetxt'><b>#{c[:tank] ? 'tank / silo' : esc(c[:shape_class].to_s)}</b>#{c[:dim].to_s.empty? ? '' : "<span class='dim'>#{c[:dim]}</span>"}<span class='ltype'>#{c[:tank] ? '' : esc(c[:likely_type].to_s)}</span>#{c[:roof].to_s.empty? ? '' : "<span class='roof'>#{esc(c[:roof])}</span>"}</span>"}</td>
+        <td><a href="#{link}" target="_blank">#{c[:lat]}, #{c[:lng]}</a></td>
+        <td class="actcell">#{c[:dismissed] ? "<button type='button' class='dismiss-btn restore' onclick='undismiss(this)'>restore</button>" : "<button type='button' class='dismiss-btn' onclick='dismissCand(this)'>dismiss</button>"}</td></tr>
       R
     end
   end
@@ -2461,7 +3308,7 @@ def results_html(result, lidar_result, source, lidar_help, lidar_imgs = [], geo_
          (top 100 shown · full list in candidates.csv / candidates.geojson)</div>
          #{calib_html(result[:calib])}
          <table><tr><th>#</th><th>Score</th><th>Area m²</th><th>Nearest addr m</th>
-         <th>Improvement</th><th>Nbrs</th><th>Shape</th><th>Location</th></tr>#{vec_rows}</table>
+         <th>Improvement</th><th>Nbrs</th><th>Use</th><th>Shape &amp; likely type</th><th>Notes</th><th>Location</th><th></th></tr>#{vec_rows}</table>
          </fieldset>"
       else '' end}
 
@@ -2488,8 +3335,8 @@ def results_html(result, lidar_result, source, lidar_help, lidar_imgs = [], geo_
         lidar_imgs.map { |srcf, cap, elev|
           live = elev ? " data-elev=\"/#{elev}\"" : ''
           controls = elev ? "<div class=\"reliefbar\" data-for=\"#{srcf}\">
-             <label>Sun <input type=\"range\" min=\"0\" max=\"360\" value=\"315\" class=\"r-az\"></label>
-             <label>Exag <input type=\"range\" min=\"1\" max=\"8\" step=\"0.5\" value=\"1\" class=\"r-z\"></label>
+             <label>Sun <span class=\"sl\"><span class=\"sl-track\"><span class=\"sl-fill\"></span><span class=\"sl-thumb\"></span></span><input type=\"range\" min=\"0\" max=\"360\" value=\"315\" class=\"r-az sl-input\"></span><span class=\"rval r-az-v\">315°</span></label>
+             <label>Exag <span class=\"sl\"><span class=\"sl-track\"><span class=\"sl-fill\"></span><span class=\"sl-thumb\"></span></span><input type=\"range\" min=\"1\" max=\"8\" step=\"0.5\" value=\"1\" class=\"r-z sl-input\"></span><span class=\"rval r-z-v\">1.0×</span></label>
              <label>Mode <select class=\"r-mode\"><option value=\"hillshade\">Hillshade</option><option value=\"multi\">Multi-direction</option><option value=\"svf\">Sky-view</option><option value=\"lrm\">Local relief (faint earthworks)</option></select></label>
              <label>Stretch <input type=\"checkbox\" class=\"r-stretch\"></label>
              <span class=\"r-zoom\"><button type=\"button\" class=\"r-zin\">＋</button><button type=\"button\" class=\"r-zout\">－</button></span>
@@ -2506,7 +3353,7 @@ def results_html(result, lidar_result, source, lidar_help, lidar_imgs = [], geo_
          <div class=\"stat\"><strong>#{lidar_result.size} flat elevated blobs</strong>
          (flattest first · full list in lidar_candidates.csv)</div>
          <table><tr><th>#</th><th>Roughness</th><th>Area m²</th><th>Height m</th>
-         <th>Shape</th><th>Location</th></tr>#{lid_rows}</table></fieldset>"
+         <th>Shape &amp; likely type</th><th>Location</th><th></th></tr>#{lid_rows}</table></fieldset>"
       else '' end}
   HTML
 end
@@ -2516,6 +3363,8 @@ def page(p, result = nil, lidar_result = nil, error = nil, source = nil, lidar_h
     (error ? "<div class=\"err\">#{esc(error)}</div>" : '') +
     form_html(p) +
     (result || lidar_help ? results_html(result, lidar_result, source, lidar_help, [], nil) : '') +
+    examined_panel_html +
+    dismissed_panel_html +
     cache_panel_html +
     PAGE_TAIL
 end
@@ -2525,14 +3374,15 @@ end
 # ============================================================================
 DEFAULTS = {
   'source' => 'files', 'loc_state' => '', 'loc_county' => '',
-  'parcel_url' => '', 'lidar_helper' => '', 'lidar_auto' => '', 'lidar_quick' => '',
+  'parcel_url' => '', 'lidar_helper' => '', 'lidar_auto' => '', 'lidar_quick' => '', 'lidar_focus' => 'top1', 'calibrate_only' => '',
   'rend_az' => '315', 'rend_z' => '1', 'rend_mode' => 'hillshade', 'rend_stretch' => '0',
-  'hide_tanks' => '',
+  'hide_tanks' => '', 'hide_dismissed' => '',
   'fp_path' => 'footprints_clip.geojson', 'ad_path' => 'addresses.geojson',
   'pc_path' => '', 'imp_field' => 'IMPROVVAL',
   'min_lon' => '', 'min_lat' => '', 'max_lon' => '', 'max_lat' => '',
   'threshold' => '50', 'min_area' => '35', 'max_area' => '2000',
   'max_search' => '500', 'max_neighbors' => '', 'neighbor_radius' => '200', 'clear_dist' => '',
+  'max_cluster' => '', 'cluster_radius' => '150', 'use_zones' => '', 'reject_zones' => '',
   'ndsm_path' => '', 'l_minh' => '2.5', 'l_maxh' => '15',
   'l_rough' => '1.2', 'l_min_area' => '30', 'l_max_area' => '3000'
 }
@@ -2563,8 +3413,12 @@ def build_cfg(p, box)
     l_rough: num(p, 'l_rough'),
     l_min_area: num(p, 'l_min_area'), l_max_area: num(p, 'l_max_area'),
     hide_tanks: p['hide_tanks'] == 'on',
+    hide_dismissed: p['hide_dismissed'] == 'on',
     max_neighbors: (p['max_neighbors'].to_s.strip.empty? ? nil : p['max_neighbors'].to_i),
     clear_dist: (p['clear_dist'].to_s.strip.empty? ? nil : p['clear_dist'].to_f),
+    max_cluster: (p['max_cluster'].to_s.strip.empty? ? nil : p['max_cluster'].to_i),
+    cluster_radius: (p['cluster_radius'].to_s.strip.empty? ? 150.0 : p['cluster_radius'].to_f),
+    reject_zones: p['reject_zones'] == 'on',
     neighbor_radius: (p['neighbor_radius'].to_s.strip.empty? ? 200.0 : p['neighbor_radius'].to_f)
   }
 end
@@ -2619,6 +3473,23 @@ def run_pipeline(p, box, log)
     source = [source, 'parcels via ArcGIS URL'].compact.join(' · ')
   end
 
+  # Pre-calibration: measure the registered-building distance distribution and
+  # stop — no candidate scoring, no LiDAR. Fast way to choose a threshold first.
+  if p['calibrate_only'] == 'on'
+    calib = calibrate_only(cfg, log)
+    return [{ calibrate_only: true, calib: calib }, nil, source, nil, [], box]
+  end
+
+  # Optional: fetch OSM industrial/railway zones so candidates can be checked
+  # for industrial-site / rail-yard context. Needs a box.
+  if p['use_zones'] == 'on' && box
+    begin
+      cfg[:zones] = osm_fetch_zones(box, box_key(box), log)
+    rescue => e
+      log.("Zone fetch skipped: #{e.message}")
+    end
+  end
+
   begin
     result = run_vector(cfg, log)
   rescue => e
@@ -2631,55 +3502,146 @@ def run_pipeline(p, box, log)
   end
   lidar_box = box
   quick = p['lidar_quick'] == 'on' && p['lidar_auto'] != 'on'
+  lidar = nil
+  extra_lidar_imgs = nil
+  big_box = box && ((box[2] - box[0]) > 0.050 || (box[3] - box[1]) > 0.040)
+
   if (p['lidar_auto'] == 'on' || quick) && box && cfg[:ndsm_path].empty?
-    # A county-sized box would need hundreds of point-cloud tiles. Focus a
-    # window on the strongest vector candidate (or the box center). Quick
-    # mode reads cheaply from the remote DEM, so its window can be wider.
-    if (box[2] - box[0]) > 0.050 || (box[3] - box[1]) > 0.040
-      top = result && result[:candidates].first
-      clat = top ? top[:lat] : (box[1] + box[3]) / 2.0
-      clng = top ? top[:lng] : (box[0] + box[2]) / 2.0
-      clat = (clat / 0.0075).round * 0.0075
-      clng = (clng / 0.0090).round * 0.0090
-      half_lng = quick ? 0.0270 : 0.0115
-      half_lat = quick ? 0.0225 : 0.0095
-      lidar_box = [clng - half_lng, clat - half_lat, clng + half_lng, clat + half_lat]
-      km_x = ((box[2] - box[0]) * m_lon(clat) / 1000).round(1)
+    half_lng = quick ? 0.0270 : 0.0115
+    half_lat = quick ? 0.0225 : 0.0095
+
+    # Decide which candidate window(s) to examine. On a big box we can't grid
+    # the whole county, so we focus windows. The focus mode controls WHICH
+    # candidates get a window — fixing the old behaviour where only #1 was ever
+    # seen and re-runs repeated the same spot.
+    focus = (p['lidar_focus'] || 'top1').to_s
+    cands = (result && result[:candidates]) ? result[:candidates].reject { |c| c[:dismissed] } : []
+    centers = []   # [label, lat, lng]
+
+    if big_box
+      if cands.empty?
+        centers << ['box center', (box[1] + box[3]) / 2.0, (box[0] + box[2]) / 2.0]
+      else
+        case focus
+        when 'top3'
+          cands.first(3).each_with_index { |c, i| centers << ["##{i + 1} candidate", c[:lat], c[:lng]] }
+        when 'next'
+          examined = load_examined
+          nextc = cands.find { |c| !examined?(examined, c[:lat], c[:lng]) }
+          if nextc
+            idx = cands.index(nextc) + 1
+            centers << ["##{idx} candidate (next unexamined)", nextc[:lat], nextc[:lng]]
+          else
+            centers << ['#1 candidate (all examined — restarting)', cands.first[:lat], cands.first[:lng]]
+          end
+        when /\Apick(\d+)\z/
+          n = Regexp.last_match(1).to_i
+          c = cands[n - 1] || cands.first
+          centers << ["##{cands.index(c) + 1} candidate", c[:lat], c[:lng]]
+        else  # top1
+          centers << ['#1 candidate', cands.first[:lat], cands.first[:lng]]
+        end
+      end
+      km_x = ((box[2] - box[0]) * m_lon((box[1] + box[3]) / 2.0) / 1000).round(1)
       km_y = ((box[3] - box[1]) * M_LAT / 1000).round(1)
       est_tiles = (km_x * km_y * 2).round
-      log.("Box measures #{km_x} x #{km_y} km — full-area LiDAR would need " \
-           "roughly #{est_tiles} tiles (~#{est_tiles / 10} GB). " +
-           (top ?
-             "Focusing a #{quick ? '~5' : '~2'} km window on your #1 candidate (snapped for cache reuse)." :
-             "Focusing a #{quick ? '~5' : '~2'} km window on the box center."))
+      win_km = quick ? '~5' : '~2'
+      log.("Box measures #{km_x} x #{km_y} km — full-area LiDAR would need roughly " \
+           "#{est_tiles} tiles (~#{est_tiles / 10} GB). Focusing #{centers.size} " \
+           "#{win_km} km window#{centers.size == 1 ? '' : 's'} (snapped for cache reuse).")
+    else
+      centers << ['whole box', (box[1] + box[3]) / 2.0, (box[0] + box[2]) / 2.0]
     end
-    begin
-      if quick
-        png = dem_ground_fallback(lidar_box, box_key(lidar_box) + '_' + rkey, log)
-        epng = png.sub(/\.png\z/, '_elev.png')
-        elev_name = File.exist?(epng) ? File.basename(epng) : nil
-        log.(elev_name ? "Live relief controls: enabled (#{elev_name})" :
-             "Live relief controls: NOT enabled — elevation file missing at #{File.basename(epng)}")
-        extra_lidar_imgs = [[File.basename(png), DEM_GROUND_CAPTION, elev_name]]
+
+    # Process each chosen window, collecting relief images and merging the
+    # LiDAR candidate lists. Overlapping windows reuse cached tiles.
+    extra_lidar_imgs = []
+    merged_lidar = []
+    centers.each do |label, rlat, rlng|
+      if big_box
+        clat = (rlat / 0.0075).round * 0.0075
+        clng = (rlng / 0.0090).round * 0.0090
+        wbox = [clng - half_lng, clat - half_lat, clng + half_lng, clat + half_lat]
       else
-        ndsm, extra_lidar_imgs = auto_lidar(lidar_box, box_key(lidar_box) + '_' + rkey, log)
-        cfg[:ndsm_path] = ndsm.to_s
+        clat = (box[1] + box[3]) / 2.0
+        clng = (box[0] + box[2]) / 2.0
+        wbox = box
       end
-    rescue => e
-      log.("LiDAR skipped: #{e.message}")
+      log.("--- LiDAR window: #{label} ---") if centers.size > 1
+      begin
+        if quick
+          png = dem_ground_fallback(wbox, box_key(wbox) + '_' + rkey, log)
+          epng = png.sub(/\.png\z/, '_elev.png')
+          elev_name = File.exist?(epng) ? File.basename(epng) : nil
+          cap = centers.size > 1 ? "#{DEM_GROUND_CAPTION} — window: #{label}" : DEM_GROUND_CAPTION
+          extra_lidar_imgs << [File.basename(png), cap, elev_name]
+          mark_examined(clat, clng) if big_box
+          lidar_box = wbox
+        else
+          ndsm, imgs_w = auto_lidar(wbox, box_key(wbox) + '_' + rkey, log)
+          if ndsm && File.exist?(ndsm.to_s)
+            wcfg = cfg.dup; wcfg[:ndsm_path] = ndsm.to_s
+            suppress = result ? result[:footprints] : (begin
+                mlon = m_lon(clat); load_footprints(cfg[:fp_path], nil, mlon).map { |r| ring_area_centroid(r, mlon) }
+              rescue StandardError; [] end)
+            merged_lidar.concat(run_lidar(wcfg, suppress, log))
+            # build this window's relief images from the gridded outputs
+            wpng = ndsm.to_s.sub(/\.asc\z/, '.png')
+            wgpng = ndsm.to_s.sub(/\.asc\z/, '_ground.png')
+            wepng = ndsm.to_s.sub(/\.asc\z/, '_elev.png')
+            welev = File.exist?(wepng) ? File.basename(wepng) : nil
+            wl = centers.size > 1 ? " — window: #{label}" : ''
+            if File.exist?(wpng)
+              extra_lidar_imgs << [File.basename(wpng),
+                'Height map: bright = ground · darker gray = taller (trees) · ' \
+                'orange = building-height surfaces (what the hunter searches)' + wl]
+            end
+            if File.exist?(wgpng)
+              extra_lidar_imgs << [File.basename(wgpng),
+                'Bare-earth hillshade: vegetation and buildings stripped away — ' \
+                'look for rectangular pads, sharp depressions, and straight lines ' \
+                '(foundations, leveled homesites, old roadbeds)' + wl, welev]
+            end
+            mark_examined(clat, clng) if big_box
+            lidar_box = wbox
+          elsif imgs_w && !imgs_w.empty?
+            # auto_lidar fell back to a remote-DEM image (no point cloud) —
+            # keep that relief image even though there's no nDSM to grid.
+            imgs_w.each do |im|
+              cap = centers.size > 1 ? "#{im[1]} — window: #{label}" : im[1]
+              extra_lidar_imgs << [im[0], cap, im[2]]
+            end
+            mark_examined(clat, clng) if big_box
+            lidar_box = wbox
+          end
+        end
+      rescue => e
+        log.("LiDAR window skipped (#{label}): #{e.message}")
+      end
+    end
+
+    lidar = merged_lidar unless merged_lidar.empty?
+    if lidar && lidar.size > 1
+      seen = []
+      lidar = lidar.reject do |c|
+        dup = seen.any? { |s| haversine_m(c[:lat], c[:lng], s[0], s[1]) < 8 }
+        seen << [c[:lat], c[:lng]] unless dup
+        dup
+      end
+      lidar.sort_by! { |c| [c[:dismissed] ? 1 : 0, c[:tank] ? 1 : 0, c[:roughness_m]] }
     end
   end
-  lidar = nil
-  unless cfg[:ndsm_path].empty?
+
+  # Manual ndsm path (user supplied their own grid): grid it directly.
+  if !cfg[:ndsm_path].empty?
     suppress =
       if result
         result[:footprints]
       else
         begin
           mlon = m_lon((box[1] + box[3]) / 2.0)
-          load_footprints(cfg[:fp_path], nil, mlon)
-            .map { |r| ring_area_centroid(r, mlon) }
-        rescue
+          load_footprints(cfg[:fp_path], nil, mlon).map { |r| ring_area_centroid(r, mlon) }
+        rescue StandardError
           []
         end
       end
@@ -2756,7 +3718,7 @@ def respond(client, html)
 end
 
 server = TCPServer.new('127.0.0.1', PORT)
-puts "Structure Hunter console [v34-glow-match]: http://localhost:#{PORT}  (Ctrl+C to stop)"
+puts "Structure Hunter console [v47-roof-shape]: http://localhost:#{PORT}  (Ctrl+C to stop)"
 
 loop do
   client = server.accept
@@ -2770,7 +3732,25 @@ loop do
       headers[k.to_s.downcase] = v.to_s.strip
     end
     params = DEFAULTS.dup
-    if method == 'POST' && req_path.to_s.start_with?('/cache/clear')
+    if method == 'POST' && req_path == '/examined/clear'
+      client.read(headers['content-length'].to_i) if headers['content-length']
+      File.delete(EXAMINED_FILE) if File.exist?(EXAMINED_FILE)
+      json = JSON.generate(ok: true)
+      client.write "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" \
+                   "Content-Length: #{json.bytesize}\r\nConnection: close\r\n\r\n#{json}"
+    elsif method == 'POST' && (req_path == '/dismiss' || req_path == '/undismiss')
+      body = client.read(headers['content-length'].to_i).to_s
+      f = {}; URI.decode_www_form(body).each { |k, v| f[k] = v }
+      lat = f['lat'].to_f; lng = f['lng'].to_f
+      n = if req_path == '/dismiss'
+            add_dismissed(lat, lng, f['reason'])
+          else
+            remove_dismissed(lat, lng)
+          end
+      json = JSON.generate(ok: true, count: n)
+      client.write "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" \
+                   "Content-Length: #{json.bytesize}\r\nConnection: close\r\n\r\n#{json}"
+    elsif method == 'POST' && req_path.to_s.start_with?('/cache/clear')
       client.read(headers['content-length'].to_i) if headers['content-length']
       freed = clear_cache(req_path.include?('clear-laz') ? 'laz' : 'all')
       body = page(DEFAULTS.dup)
