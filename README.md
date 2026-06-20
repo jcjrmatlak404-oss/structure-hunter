@@ -9,7 +9,7 @@ Structure Hunter cross-references *what is physically there* — building footpr
 It runs entirely on your own machine as a local web app. Everything it uses is public, authoritative data: OpenStreetMap and state building footprints, the National Address Database and state address points, county parcel layers, and USGS 3DEP LiDAR and elevation models.
 
 ![The Structure Hunter console](docs/screenshot.png)
-
+![Live relief rendering demo](docs/demo.gif)
 ---
 
 ## What it does
