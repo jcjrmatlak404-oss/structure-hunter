@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # ============================================================================
 # hunter_app.rb — local web interface for the structure-hunting toolkit
-# BUILD: v47-roof-shape (live picture controls · cache panel · relief render)
+# BUILD: v63-compact-actions (live picture controls · cache panel · relief render)
 #
 # Run:     ruby hunter_app.rb          (then open http://localhost:8080)
 # Stop:    Ctrl+C
@@ -140,6 +140,167 @@ def min_area_rect(points, area)
   best[:fill] = best[:box_area] > 0 ? area / best[:box_area] : 1.0  # 1=perfect rectangle
   best[:elong] = best[:short] > 0 ? best[:long] / best[:short] : 1.0
   best
+end
+
+# ----------------------------------------------------------------------------
+# SHAPE SIGNATURE & MATCHING
+# A footprint's "fingerprint": numbers that describe its shape independent of
+# where it is, how big it is, or which way it's turned — so the same shape
+# matches whether it's rotated on the map, a different size, or mirrored.
+# Combines Hu invariant moments (classic rotation/scale/reflection-invariant
+# shape descriptors) with normalized geometric ratios. Two footprints with
+# close signatures are similar shapes.
+# ----------------------------------------------------------------------------
+
+# Hu's seven invariant moments computed EXACTLY from the filled polygon via the
+# Green's-theorem area-moment formulas. Unlike sampling the boundary, this is
+# independent of how the outline is vertexed — the same shape gives the same
+# moments whether it has 6 points or 600. Returns 7 log-scaled, sign-preserved
+# numbers (rotation/scale/reflection invariant).
+def hu_moments(points)
+  pts = points.dup
+  pts.pop if pts.size > 1 && pts.first == pts.last   # open ring for the sums
+  n = pts.size
+  return [0.0] * 7 if n < 3
+
+  # raw polygon moments M_pq via the standard closed-form per-edge contributions
+  a = 0.0  # 2*signed area
+  m10 = 0.0; m01 = 0.0
+  m20 = 0.0; m11 = 0.0; m02 = 0.0
+  m30 = 0.0; m21 = 0.0; m12 = 0.0; m03 = 0.0
+  n.times do |i|
+    x0, y0 = pts[i]
+    x1, y1 = pts[(i + 1) % n]
+    cr = x0 * y1 - x1 * y0           # cross term for this edge
+    a += cr
+    m10 += (x0 + x1) * cr
+    m01 += (y0 + y1) * cr
+    m20 += (x0 * x0 + x0 * x1 + x1 * x1) * cr
+    m02 += (y0 * y0 + y0 * y1 + y1 * y1) * cr
+    m11 += (2 * x0 * y0 + x0 * y1 + x1 * y0 + 2 * x1 * y1) * cr
+    m30 += (x0 + x1) * (x0 * x0 + x1 * x1) * cr
+    m03 += (y0 + y1) * (y0 * y0 + y1 * y1) * cr
+    m21 += (x0 * x0 * (3 * y0 + y1) + 2 * x0 * x1 * (y0 + y1) + x1 * x1 * (y0 + 3 * y1)) * cr
+    m12 += (y0 * y0 * (3 * x0 + x1) + 2 * y0 * y1 * (x0 + x1) + y1 * y1 * (x0 + 3 * x1)) * cr
+  end
+  area = a / 2.0
+  return [0.0] * 7 if area.abs < 1e-9
+  m00 = area
+  m10 /= 6.0; m01 /= 6.0
+  m20 /= 12.0; m02 /= 12.0; m11 /= 24.0
+  m30 /= 20.0; m03 /= 20.0; m21 /= 60.0; m12 /= 60.0
+
+  # centroid
+  cx = m10 / m00; cy = m01 / m00
+  # central moments (mu_pq) — these scale as area^(1 + (p+q)/2)
+  mu20 = m20 - cx * m10
+  mu02 = m02 - cy * m01
+  mu11 = m11 - cx * m01
+  mu30 = m30 - 3 * cx * m20 + 2 * cx * cx * m10
+  mu03 = m03 - 3 * cy * m02 + 2 * cy * cy * m01
+  mu21 = m21 - 2 * cx * m11 - cy * m20 + 2 * cx * cx * m01
+  mu12 = m12 - 2 * cy * m11 - cx * m02 + 2 * cy * cy * m10
+
+  # scale-normalized central moments: eta_pq = mu_pq / m00^(1 + (p+q)/2)
+  a2 = m00.abs**2          # 2nd order: 1 + 2/2 = 2
+  a25 = m00.abs**2.5       # 3rd order: 1 + 3/2 = 2.5
+  n20 = mu20 / a2; n02 = mu02 / a2; n11 = mu11 / a2
+  n30 = mu30 / a25; n03 = mu03 / a25; n21 = mu21 / a25; n12 = mu12 / a25
+
+  h = []
+  h << n20 + n02
+  h << (n20 - n02)**2 + 4 * n11**2
+  h << (n30 - 3 * n12)**2 + (3 * n21 - n03)**2
+  h << (n30 + n12)**2 + (n21 + n03)**2
+  h << (n30 - 3 * n12) * (n30 + n12) * ((n30 + n12)**2 - 3 * (n21 + n03)**2) +
+       (3 * n21 - n03) * (n21 + n03) * (3 * (n30 + n12)**2 - (n21 + n03)**2)
+  h << (n20 - n02) * ((n30 + n12)**2 - (n21 + n03)**2) +
+       4 * n11 * (n30 + n12) * (n21 + n03)
+  h << (3 * n21 - n03) * (n30 + n12) * ((n30 + n12)**2 - 3 * (n21 + n03)**2) -
+       (n30 - 3 * n12) * (n21 + n03) * (3 * (n30 + n12)**2 - (n21 + n03)**2)
+  # log-scale (sign-preserving). Floor tiny values to zero first: for symmetric
+  # shapes the higher moments are theoretically zero, and without flooring,
+  # floating-point noise (~1e-12) gets log-amplified into large spurious values.
+  h.map do |v|
+    if v.abs < 1e-7 then 0.0
+    else Math.log10(v.abs) * (v <=> 0)
+    end
+  end
+end
+
+# Full shape signature: Hu moments + the normalized ratios. Rotation/scale/
+# reflection invariant. `area`/`perimeter` in meters.
+def shape_signature(points, area, perimeter)
+  d = shape_descriptors(points, area, perimeter)
+  rect = min_area_rect(points, area)
+  {
+    hu: hu_moments(points),
+    elong: rect ? rect[:elong] : (d ? d[:aspect] : 1.0),
+    fill: rect ? rect[:fill] : (d ? d[:extent] : 1.0),
+    solidity: d ? d[:solidity] : 1.0,
+    circularity: d ? d[:circularity] : 0.0
+  }
+end
+
+# Distance between two signatures — smaller = more similar. The first two Hu
+# moments are the most stable and discriminating; higher orders are noisier, so
+# they're down-weighted. Blended with the normalized ratio differences. Returns
+# a score where ~0 is a near-perfect shape match.
+def shape_distance(a, b)
+  return 9.99 unless a && b
+  ha = a[:hu]; hb = b[:hu]
+  # per-moment weights: lower orders matter most
+  w = [1.0, 0.8, 0.5, 0.5, 0.25, 0.35, 0.25]
+  hu = 0.0; wsum = 0.0
+  7.times do |i|
+    hu += w[i] * (ha[i] - hb[i]).abs
+    wsum += w[i]
+  end
+  hu /= wsum
+  el = (Math.log((a[:elong] || 1).clamp(0.1, 50)) - Math.log((b[:elong] || 1).clamp(0.1, 50))).abs
+  fi = (a[:fill].to_f - b[:fill].to_f).abs
+  so = (a[:solidity].to_f - b[:solidity].to_f).abs
+  ci = (a[:circularity].to_f - b[:circularity].to_f).abs
+  # elongation & fill are strong, intuitive shape cues — weight them meaningfully
+  0.30 * hu + 0.40 * el + 0.18 * fi + 0.07 * so + 0.05 * ci
+end
+
+# Convert a shape distance to an intuitive 0–100% match score. Tuned so a clear
+# shape twin lands ~85–100%, a same-family-but-different shape ~50–75%, and an
+# unrelated shape near 0.
+def shape_match_pct(dist)
+  [[100 * Math.exp(-1.1 * dist), 0].max, 100].min.round
+end
+
+# Parse a pasted target outline into a signature. Accepts loose coordinate text:
+# "x,y" pairs (one per line or separated by spaces/semicolons), or "lng,lat"
+# geographic pairs (auto-detected and projected to local meters). The shape only
+# needs its relative proportions — absolute position/size/rotation don't matter.
+def parse_target_shape(text)
+  return nil if text.nil? || text.strip.empty?
+  nums = text.scan(/-?\d+\.?\d*/).map(&:to_f)
+  return nil if nums.size < 6      # need at least 3 points
+  pairs = nums.each_slice(2).to_a.select { |p| p.size == 2 }
+  return nil if pairs.size < 3
+  # geographic? (all look like lng/lat) -> project to local meters
+  geo = pairs.all? { |x, y| x.abs <= 180 && y.abs <= 90 } &&
+        pairs.any? { |x, y| x.abs > 1 && y.abs > 1 }
+  if geo
+    lat0 = pairs.sum { |_, y| y } / pairs.size
+    mlon = m_lon(lat0)
+    pts = pairs.map { |x, y| [(x - pairs[0][0]) * mlon, (y - pairs[0][1]) * M_LAT] }
+  else
+    pts = pairs.map { |x, y| [x, y] }
+  end
+  pts << pts.first unless pts.first == pts.last   # close the ring
+  # area & perimeter
+  area = polygon_area(pts[0...-1])
+  perim = 0.0
+  pts.each_cons(2) { |(x1, y1), (x2, y2)| perim += Math.hypot(x2 - x1, y2 - y1) }
+  return nil if area <= 0 || perim <= 0
+  sig = shape_signature(pts, area, perim)
+  cls = classify_footprint(pts, area, perim)
+  { sig: sig, shape: cls[:shape], glyph: shape_glyph_svg(pts, cls[:long], cls[:short]) }
 end
 
 # Classify a footprint into a shape family and a likely structure type, from its
@@ -406,12 +567,67 @@ end
 NONRES_WORDS = %w[COMMERC INDUST RAIL WAREHOUS MANUF UTILIT SUBSTAT
                   STORAGE PLANT FACTOR TERMINAL DEPOT FREIGHT QUARRY MINE
                   REFINER YARD PORT AIRPORT HANGAR].freeze
-def parcel_use_flag(ctx)
+
+# Institutional / civic / religious / recreational uses. These match the
+# footprint-vs-address "no nearby address" signature for innocent reasons —
+# big buildings set far back on large lots with a single street-placed address —
+# so they flood results with churches, rec centers, clubs, schools, etc. that
+# are well-known, not hidden. Flagged and sunk like industrial sites.
+INSTITUTIONAL_WORDS = %w[CHURCH CHAPEL TEMPLE MOSQUE SYNAGOG WORSHIP RELIG
+                         MINISTR PARISH CONGREG CATHEDRAL DIOCES
+                         SCHOOL ACADEMY COLLEGE UNIVERS EDUCAT CAMPUS DAYCARE
+                         RECREAT GYMNAS ATHLETIC STADIUM ARENA BALLFIELD CLUB
+                         LODGE FRATERN SOROR COMMUNIT CIVIC HALL AUDITOR
+                         GOVERN MUNICIP COUNTY CITY STATE FEDERAL PUBLIC
+                         FIRE EMS RESCUE POLICE SHERIFF PRISON JAIL COURT
+                         LIBRAR MUSEUM HOSPITAL CLINIC MEDIC NURSING
+                         CEMETER FUNERAL PARK FAIRGROUND CAMP SCOUT YMCA YWCA
+                         NONPROF CHARIT FOUNDAT ASSOCIAT SOCIETY POST_OFFICE].freeze
+
+# Returns [label, category] when a parcel's use looks non-residential, where
+# category is :industrial or :institutional; nil otherwise.
+def parcel_use_class(ctx)
   return nil unless ctx.is_a?(Hash)
-  d = "#{ctx[:use_desc]} #{ctx[:use_desc2]}".upcase
+  d1 = ctx[:use_desc].to_s.upcase
+  d2 = ctx[:use_desc2].to_s.upcase
+  d = "#{d1} #{d2}"
   return nil if d.strip.empty?
-  hit = NONRES_WORDS.find { |w| d.include?(w) }
-  hit ? ctx[:use_desc] : nil
+  if INSTITUTIONAL_WORDS.any? { |w| d.include?(w) }
+    # prefer whichever descriptor field actually carries the institutional term,
+    # so the label reads "CHURCH" rather than a generic "COMMERCIAL"
+    label = if INSTITUTIONAL_WORDS.any? { |w| d2.include?(w) } && !d2.strip.empty?
+              ctx[:use_desc2]
+            else
+              ctx[:use_desc]
+            end
+    return [label, :institutional]
+  end
+  if NONRES_WORDS.any? { |w| d.include?(w) }
+    return [ctx[:use_desc], :industrial]
+  end
+  nil
+end
+
+# Backwards-compatible: just the description if non-residential, else nil.
+def parcel_use_flag(ctx)
+  c = parcel_use_class(ctx)
+  c ? c[0] : nil
+end
+
+# Owner type that is clearly an organization, not a person — churches, clubs,
+# associations, governments. A strong "well-known institution, not a hidden
+# structure" signal. Returns a short label or nil.
+ORG_OWNER_WORDS = %w[CHURCH RELIG MINISTR TEMPLE CONGREG PARISH DIOCES
+                     CLUB LODGE ASSOCIAT ASSN SOCIETY FOUNDAT NONPROF CHARIT
+                     INC LLC CORP COMPANY CO TRUST
+                     COUNTY CITY TOWN STATE FEDERAL GOVERNMENT MUNICIP
+                     SCHOOL COLLEGE UNIVERS DISTRICT AUTHORITY COMMISSION
+                     DEPARTMENT BOARD AGENCY USA].freeze
+def org_owner_flag(ctx)
+  return nil unless ctx.is_a?(Hash)
+  name = ctx[:owner].to_s.upcase
+  return nil if name.empty?
+  ORG_OWNER_WORDS.find { |w| name.split(/[^A-Z]+/).include?(w) || name.include?(" #{w} ") || name.start_with?("#{w} ") || name.end_with?(" #{w}") } ? 'organization-owned' : nil
 end
 
 # ============================================================================
@@ -496,6 +712,81 @@ end
 # Returns the dismissed record (with its reason) or nil.
 def dismissed_match(dismissed, lat, lng)
   dismissed.find { |d| haversine_m(lat, lng, d[:lat], d[:lng]) <= DISMISS_RADIUS_M }
+end
+
+# ----------------------------------------------------------------------------
+# SAVED PLACES — an archive of finds worth investigating further.
+# Modeled on the dismiss system: keyed to physical coordinates, matched by
+# proximity, persisted to a file that survives cache clears and spans scans.
+# But richer: each entry keeps the context the tool knew (likely type, shape,
+# notes, which mode found it, coordinates), a timestamp, and an optional
+# free-text note the user adds. This is a running, cross-scan list of places
+# to look at more closely — reviewable in a panel and exportable for the field.
+# ----------------------------------------------------------------------------
+SAVED_FILE = File.join(CACHE_DIR, 'saved_places.json')
+SAVED_RADIUS_M = 20.0
+
+def load_saved
+  return [] unless File.exist?(SAVED_FILE)
+  JSON.parse(File.read(SAVED_FILE), symbolize_names: true)
+rescue
+  []
+end
+
+def save_saved(list)
+  Dir.mkdir(CACHE_DIR) unless Dir.exist?(CACHE_DIR)
+  File.write(SAVED_FILE, JSON.generate(list))
+end
+
+# Add (or update) a saved place. `meta` carries the auto-captured context.
+def add_saved(lat, lng, meta = {})
+  list = load_saved
+  # if one already sits within the match radius, preserve its note/date and
+  # refresh the context (so re-saving from a new scan updates the details)
+  existing = list.find { |s| haversine_m(lat, lng, s[:lat], s[:lng]) <= SAVED_RADIUS_M }
+  note = meta[:note].to_s.strip[0, 240]
+  if existing
+    note = existing[:note].to_s if note.empty?     # keep old note if none given
+    existing.merge!(
+      label: (meta[:label].to_s.strip[0, 80].empty? ? existing[:label] : meta[:label].to_s.strip[0, 80]),
+      shape: (meta[:shape].to_s.strip.empty? ? existing[:shape] : meta[:shape].to_s.strip[0, 60]),
+      info:  (meta[:info].to_s.strip.empty?  ? existing[:info]  : meta[:info].to_s.strip[0, 200]),
+      mode:  (meta[:mode].to_s.strip.empty?  ? existing[:mode]  : meta[:mode].to_s.strip[0, 40]),
+      note: note
+    )
+  else
+    list << { lat: lat.round(6), lng: lng.round(6),
+              label: meta[:label].to_s.strip[0, 80],
+              shape: meta[:shape].to_s.strip[0, 60],
+              info:  meta[:info].to_s.strip[0, 200],
+              mode:  meta[:mode].to_s.strip[0, 40],
+              note: note,
+              at: Time.now.strftime('%Y-%m-%d') }
+  end
+  save_saved(list)
+  list.size
+end
+
+# Update just the note on an existing saved place (from the review panel).
+def update_saved_note(lat, lng, note)
+  list = load_saved
+  s = list.find { |e| haversine_m(lat, lng, e[:lat], e[:lng]) <= SAVED_RADIUS_M }
+  return load_saved.size unless s
+  s[:note] = note.to_s.strip[0, 240]
+  save_saved(list)
+  list.size
+end
+
+def remove_saved(lat, lng)
+  list = load_saved
+  list.reject! { |s| haversine_m(lat, lng, s[:lat], s[:lng]) <= SAVED_RADIUS_M }
+  save_saved(list)
+  list.size
+end
+
+# Is this candidate already saved? Returns the saved record or nil.
+def saved_match(saved, lat, lng)
+  saved.find { |s| haversine_m(lat, lng, s[:lat], s[:lng]) <= SAVED_RADIUS_M }
 end
 
 # Small-distance great-circle metres (good enough at candidate scale).
@@ -605,7 +896,7 @@ def osm_fetch_zones(box, key, log = NOOP_LOG)
     log.('Industrial/railway zones: using cache')
     return JSON.parse(File.read(zf), symbolize_names: true)
   end
-  log.('Fetching industrial & railway zones from OpenStreetMap...')
+  log.('Fetching industrial, railway & institutional zones from OpenStreetMap...')
   bbox = "#{box[1]},#{box[0]},#{box[3]},#{box[2]}"
   q = %{[out:json][timeout:180];(} +
       %{way["landuse"="industrial"](#{bbox});} +
@@ -615,15 +906,39 @@ def osm_fetch_zones(box, key, log = NOOP_LOG)
       %{way["man_made"="works"](#{bbox});} +
       %{way["railway"="yard"](#{bbox});} +
       %{way["aeroway"="aerodrome"](#{bbox});} +
+      %{way["amenity"="place_of_worship"](#{bbox});} +
+      %{way["amenity"="community_centre"](#{bbox});} +
+      %{way["amenity"="school"](#{bbox});} +
+      %{way["amenity"="college"](#{bbox});} +
+      %{way["amenity"="university"](#{bbox});} +
+      %{way["amenity"="hospital"](#{bbox});} +
+      %{way["leisure"="sports_centre"](#{bbox});} +
+      %{way["leisure"="stadium"](#{bbox});} +
+      %{way["landuse"="cemetery"](#{bbox});} +
+      %{way["amenity"="fire_station"](#{bbox});} +
+      %{node["amenity"="place_of_worship"](#{bbox});} +
+      %{node["amenity"="community_centre"](#{bbox});} +
+      %{node["leisure"="sports_centre"](#{bbox});} +
       %{way["railway"="rail"](#{bbox});} +
       %{);out geom;}
   els = overpass(q)
   polys = []   # [label, [ [lng,lat],... ]]
   rails = []   # [ [lng,lat],... ]  (rail centerlines, buffered at test time)
+  pois  = []   # [label, lng, lat]  (institutional point features, buffered)
   els.each do |el|
+    tags = el['tags'] || {}
+    # institutional point (node) features — buffer like a small zone
+    if el['type'] == 'node' && el['lon'] && el['lat']
+      lbl =
+        if tags['amenity'] == 'place_of_worship' then 'place of worship'
+        elsif tags['amenity'] == 'community_centre' then 'community center'
+        elsif tags['leisure'] == 'sports_centre' then 'sports center'
+        else 'institutional' end
+      pois << [lbl, el['lon'], el['lat']]
+      next
+    end
     g = el['geometry'] or next
     pts = g.map { |pt| [pt['lon'], pt['lat']] }
-    tags = el['tags'] || {}
     if tags['railway'] == 'rail' && tags['landuse'].nil?
       rails << pts if pts.size >= 2
     else
@@ -635,14 +950,327 @@ def osm_fetch_zones(box, key, log = NOOP_LOG)
         elsif tags['landuse'] == 'quarry' then 'quarry'
         elsif tags['aeroway'] then 'airport'
         elsif tags['landuse'] == 'commercial' then 'commercial zone'
-        else 'industrial zone' end
+        elsif tags['amenity'] == 'place_of_worship' then 'place of worship'
+        elsif tags['amenity'] == 'community_centre' then 'community center'
+        elsif %w[school college university].include?(tags['amenity']) then 'school / campus'
+        elsif tags['amenity'] == 'hospital' then 'hospital'
+        elsif tags['amenity'] == 'fire_station' then 'fire station'
+        elsif tags['leisure'] == 'sports_centre' then 'sports center'
+        elsif tags['leisure'] == 'stadium' then 'stadium'
+        elsif tags['landuse'] == 'cemetery' then 'cemetery'
+        else 'institutional zone' end
       polys << [label, pts]
     end
   end
-  data = { polys: polys, rails: rails }
+  data = { polys: polys, rails: rails, pois: pois }
   File.write(zf, JSON.generate(data))
-  log.("Zones fetched: #{polys.size} areas, #{rails.size} rail lines")
+  log.("Zones fetched: #{polys.size} areas, #{rails.size} rail lines, #{pois.size} institutions")
   JSON.parse(JSON.generate(data), symbolize_names: true)
+end
+
+# ----------------------------------------------------------------------------
+# CLOSED / INACTIVE INSTITUTIONS
+# Find institutions (schools, jails, hospitals, colleges, civic buildings) that
+# are closed, defunct, or abandoned. Two independent signals, combined:
+#   (1) OSM "lifecycle" tags — mappers mark closed features with prefixes like
+#       disused:amenity=school, abandoned:amenity=hospital, was:amenity=prison,
+#       or amenity=school + disused=yes. Authoritative "known-closed" hits with
+#       coordinates, anywhere OSM is mapped. (works in any state)
+#   (2) Parcel heuristic (where parcel data exists) — an institutional use code
+#       or government/organization owner on a parcel whose IMPROVEMENT value has
+#       collapsed to ~zero: the building was institutional but is now valueless,
+#       i.e. condemned, demolished-but-on-record, or sitting unused.
+# These are CANDIDATES; the app points the user to authoritative registries
+# (state archives, county property search) to confirm each one.
+# ----------------------------------------------------------------------------
+
+# institution kinds we care about, by their OSM amenity/building value
+CLOSED_INST_KINDS = %w[school college university kindergarten
+                       hospital clinic prison
+                       community_centre social_facility townhall courthouse
+                       fire_station police library theatre place_of_worship
+                       monastery].freeze
+
+# Large-format retail we treat alongside institutions: malls, department stores,
+# shopping centers, big-box, supermarkets. These use the OSM `shop` key (plus
+# building=retail / landuse=retail). Small shops are deliberately excluded —
+# they turn over constantly and would flood results with low-signal noise.
+CLOSED_RETAIL_SHOPS = %w[mall department_store supermarket wholesale
+                         hypermarket variety_store].freeze
+
+def osm_fetch_closed_institutions(box, key, log = NOOP_LOG)
+  Dir.mkdir(CACHE_DIR) unless Dir.exist?(CACHE_DIR)
+  cf = File.join(CACHE_DIR, "osm_closed_inst_#{key}.json")
+  if File.exist?(cf)
+    log.('Closed institutions (OSM): using cache')
+    return JSON.parse(File.read(cf), symbolize_names: true)
+  end
+  log.('Searching OpenStreetMap for closed / disused / abandoned institutions...')
+  bbox = "#{box[1]},#{box[0]},#{box[3]},#{box[2]}"
+  # lifecycle prefixes mappers use for no-longer-active features
+  prefixes = %w[disused abandoned was demolished razed removed]
+  parts = []
+  prefixes.each do |pre|
+    # prefixed amenity (e.g. disused:amenity=school) on ways and nodes
+    CLOSED_INST_KINDS.each do |k|
+      parts << %{way["#{pre}:amenity"="#{k}"](#{bbox});}
+      parts << %{node["#{pre}:amenity"="#{k}"](#{bbox});}
+    end
+    # prefixed LARGE retail (e.g. disused:shop=mall, abandoned:shop=department_store)
+    CLOSED_RETAIL_SHOPS.each do |s|
+      parts << %{way["#{pre}:shop"="#{s}"](#{bbox});}
+      parts << %{node["#{pre}:shop"="#{s}"](#{bbox});}
+    end
+    # prefixed building types (e.g. abandoned:building=school / =retail)
+    %w[school hospital university college church chapel public civic
+       retail commercial supermarket].each do |b|
+      parts << %{way["#{pre}:building"="#{b}"](#{bbox});}
+    end
+    # prefixed retail land use (a demolished/abandoned shopping center site)
+    parts << %{way["#{pre}:landuse"="retail"](#{bbox});}
+    # generic prefixed building (disused:building=yes) — caught, filtered later
+    parts << %{way["#{pre}:building"="yes"](#{bbox});}
+  end
+  # active-kind features explicitly flagged disused/abandoned via a status tag
+  CLOSED_INST_KINDS.each do |k|
+    parts << %{way["amenity"="#{k}"]["disused"="yes"](#{bbox});}
+    parts << %{way["amenity"="#{k}"]["abandoned"="yes"](#{bbox});}
+    parts << %{node["amenity"="#{k}"]["disused"="yes"](#{bbox});}
+  end
+  # large retail flagged disused/abandoned via a status tag
+  CLOSED_RETAIL_SHOPS.each do |s|
+    parts << %{way["shop"="#{s}"]["disused"="yes"](#{bbox});}
+    parts << %{way["shop"="#{s}"]["abandoned"="yes"](#{bbox});}
+  end
+  q = "[out:json][timeout:180];(" + parts.join + ");out geom;"
+  els = begin
+    overpass(q)
+  rescue => e
+    log.("Closed-institution OSM query failed: #{e.message}")
+    []
+  end
+
+  found = []
+  els.each do |el|
+    tags = el['tags'] || {}
+    # work out a human label + which lifecycle state + what kind + category
+    state = nil; kind = nil; category = nil
+    tags.each do |k, v|
+      if k =~ /\A(disused|abandoned|was|demolished|razed|removed):amenity\z/
+        state = Regexp.last_match(1); kind = v; category = 'institution'
+      elsif k =~ /\A(disused|abandoned|was|demolished|razed|removed):shop\z/
+        state = Regexp.last_match(1); kind = v; category = 'retail'
+      elsif k =~ /\A(disused|abandoned|was|demolished|razed|removed):landuse\z/ && v == 'retail'
+        state ||= Regexp.last_match(1); kind ||= 'retail site'; category ||= 'retail'
+      elsif k =~ /\A(disused|abandoned|was|demolished|razed|removed):building\z/
+        state ||= Regexp.last_match(1); kind ||= v
+        category ||= %w[retail commercial supermarket].include?(v) ? 'retail' : 'institution'
+      end
+    end
+    if state.nil? && (tags['disused'] == 'yes' || tags['abandoned'] == 'yes')
+      state = tags['abandoned'] == 'yes' ? 'abandoned' : 'disused'
+      if tags['shop']
+        kind = tags['shop']; category = 'retail'
+      else
+        kind = tags['amenity'] || tags['building']; category = 'institution'
+      end
+    end
+    next if state.nil?
+    name = tags['name'] || tags['old_name'] || tags['disused:name'] ||
+           tags['was:name'] || tags['brand'] || tags['disused:brand'] || nil
+    knd = (kind || '').to_s
+    # keep recognizable institution kinds, large-retail SHOP kinds, or named sites
+    is_inst_kind = CLOSED_INST_KINDS.include?(knd) ||
+                   %w[school hospital university college church chapel civic public
+                      courthouse townhall library prison].include?(knd)
+    is_big_retail_kind = CLOSED_RETAIL_SHOPS.include?(knd)
+    # generic building=commercial/retail/supermarket and landuse=retail are too
+    # broad on their own (any commercial building) — only keep them if NAMED, so
+    # we get "Forman Mills" but not anonymous small commercial boxes.
+    is_generic_retail = %w[retail commercial supermarket].include?(knd) || knd == 'retail site'
+    next unless is_inst_kind || is_big_retail_kind || (is_generic_retail && name) || (name && !is_generic_retail)
+    category ||= (is_big_retail_kind || is_generic_retail) ? 'retail' : 'institution'
+
+    # centroid
+    if el['type'] == 'node'
+      lng = el['lon']; lat = el['lat']
+    elsif el['geometry'] && !el['geometry'].empty?
+      g = el['geometry']
+      lng = g.sum { |p| p['lon'] } / g.size
+      lat = g.sum { |p| p['lat'] } / g.size
+    else
+      next
+    end
+    found << { lat: lat.round(6), lng: lng.round(6), state: state, category: category,
+               kind: (kind || category).to_s.tr('_', ' '), name: name }
+  end
+  # de-dupe by proximity
+  uniq = []
+  found.each do |f|
+    dup = uniq.any? { |u| (u[:lat] - f[:lat]).abs < 0.0002 && (u[:lng] - f[:lng]).abs < 0.0002 }
+    uniq << f unless dup
+  end
+  File.write(cf, JSON.generate(uniq))
+  log.("Closed institutions found in OSM: #{uniq.size}")
+  JSON.parse(JSON.generate(uniq), symbolize_names: true)
+end
+
+# Words that mark a parcel as institutional/public for the closed-institution
+# heuristic (broader than the suppression list — we WANT these here).
+CLOSED_INST_USE_WORDS = %w[SCHOOL ACADEMY COLLEGE UNIVERS EDUCAT CAMPUS
+                           HOSPITAL CLINIC MEDIC SANITAR ASYLUM INFIRM
+                           PRISON JAIL CORRECT DETENT PENITENT REFORMAT
+                           CHURCH CHAPEL TEMPLE WORSHIP RELIG PARISH CONVENT MONAST
+                           CIVIC MUNICIP GOVERN COURT TOWNHALL CITYHALL
+                           LIBRAR MUSEUM ARMORY FIRE RESCUE POLICE STATION
+                           INSTITUT PUBLIC ORPHAN POORHOUSE ALMSHOUSE].freeze
+CLOSED_INST_OWNER_WORDS = %w[COUNTY CITY TOWN STATE FEDERAL GOVERNMENT MUNICIP
+                             SCHOOL DISTRICT BOARD OF EDUCATION AUTHORITY
+                             COMMISSION DEPARTMENT AGENCY USA CHURCH DIOCES].freeze
+
+# Derive a readable institution kind from a parcel use description.
+def closed_inst_kind_from_use(d)
+  return 'school' if d =~ /SCHOOL|ACADEMY|EDUCAT|KINDER/
+  return 'college' if d =~ /COLLEGE|UNIVERS|CAMPUS/
+  return 'hospital / medical' if d =~ /HOSPITAL|CLINIC|MEDIC|SANITAR|ASYLUM|INFIRM/
+  return 'jail / prison' if d =~ /PRISON|JAIL|CORRECT|DETENT|PENITENT|REFORMAT/
+  return 'church / religious' if d =~ /CHURCH|CHAPEL|TEMPLE|WORSHIP|RELIG|PARISH|CONVENT|MONAST/
+  return 'courthouse / civic' if d =~ /COURT|TOWNHALL|CITYHALL|CIVIC|MUNICIP|GOVERN/
+  return 'library / museum' if d =~ /LIBRAR|MUSEUM/
+  return 'fire / police' if d =~ /FIRE|RESCUE|POLICE|ARMORY/
+  'institution'
+end
+
+# Large-format retail use-code words. Deliberately the BIG stuff only: malls,
+# department stores, shopping centers, big-box, supermarkets. We do NOT include
+# bare "COMMERCIAL"/"RETAIL"/"STORE" — those are huge generic buckets full of
+# still-active small businesses that would flood results.
+CLOSED_RETAIL_USE_WORDS = ['SHOPPING CENT', 'SHOPPING MALL', 'SHOPPING CTR',
+                           'MALL', 'DEPARTMENT STORE', 'DEPT STORE', 'BIG BOX',
+                           'BIG-BOX', 'SUPERMARKET', 'SUPER MARKET', 'GROCERY',
+                           'DISCOUNT STORE', 'SUPERSTORE', 'SUPERCENTER',
+                           'RETAIL - REGIONAL', 'COMMERCIAL SHOPPING'].freeze
+
+# Readable large-retail kind from a parcel use description (nil if not big retail).
+def closed_retail_kind_from_use(d)
+  return 'shopping mall' if d =~ /MALL|SHOPPING CENT|SHOPPING CTR|SHOPPING MALL|COMMERCIAL SHOPPING|RETAIL - REGIONAL/
+  return 'department store' if d =~ /DEPARTMENT STORE|DEPT STORE|BIG.?BOX|SUPERSTORE|SUPERCENTER|DISCOUNT STORE/
+  return 'supermarket' if d =~ /SUPERMARKET|SUPER MARKET|GROCERY/
+  nil
+end
+
+# Combine the two closed-institution signals into one ranked candidate list.
+# (1) OSM lifecycle-tagged closures (any state). (2) Parcel heuristic where
+# parcel data exists: institutional use/owner + a collapsed improvement value.
+def find_closed_institutions(cfg, log = NOOP_LOG)
+  out = []
+
+  # ---- signal 1: OSM lifecycle tags ----
+  begin
+    osm = osm_fetch_closed_institutions(cfg[:box_for_osm] || cfg[:orig_box], box_key(cfg[:orig_box]), log)
+    osm.each do |f|
+      out << {
+        lat: f[:lat], lng: f[:lng], source: 'OSM',
+        kind: f[:kind], name: f[:name],
+        state: f[:state], category: (f[:category] || 'institution'),
+        why: "OSM tagged #{f[:state]}#{f[:name] ? '' : " #{f[:kind]}"}",
+        score: (%w[abandoned disused].include?(f[:state]) ? 1.0 : 0.85)
+      }
+    end
+  rescue => e
+    log.("OSM closed-institution signal skipped: #{e.message}")
+  end
+
+  # ---- signal 2: parcel heuristic (institutional + collapsed value) ----
+  if cfg[:pc_path] && !cfg[:pc_path].to_s.empty? && File.exist?(cfg[:pc_path].to_s)
+    begin
+      log.('Scanning parcels for institutional sites with collapsed building value...')
+      parcels = load_parcels(cfg[:pc_path], cfg[:imp_field], nil)
+      mlon = nil
+      n_inst = 0; n_retail = 0
+      parcels.each do |rings, ctx|
+        ring = rings[0]
+        # centroid (lng,lat)
+        cx = ring.sum { |p| p[0] } / ring.size
+        cy = ring.sum { |p| p[1] } / ring.size
+        d = "#{ctx[:use_desc]} #{ctx[:use_desc2]}".upcase
+        owner = ctx[:owner].to_s.upcase
+
+        # vacant-land use codes are never a closed building, whatever the type
+        next if d =~ /VACANT|VAC LAND|RIGHT.?OF.?WAY|ROW |UNIMPROV|GREENWAY|PARK\b|OPEN SPACE|CEMETER|PARKING/
+
+        # classify the parcel: institutional, large-retail, or neither
+        inst_specific = closed_inst_kind_from_use(d)
+        use_inst = CLOSED_INST_USE_WORDS.any? { |w| d.include?(w) } &&
+                   !(inst_specific == 'institution' && d !~ /INSTITUTIONAL/)
+        retail_specific = closed_retail_kind_from_use(d)
+        use_retail = !retail_specific.nil? && CLOSED_RETAIL_USE_WORDS.any? { |w| d.include?(w) }
+
+        next unless use_inst || use_retail
+        imp = ctx[:imp]
+        next if imp.nil?
+        had_structure = ctx[:has_struct].to_s.strip =~ /\A(Y|YES|TRUE|1)/i
+
+        if use_inst
+          n_inst += 1
+          # An active institution is a large, valuable building. A collapsed
+          # improvement value signals no active building. Low, and (for exact
+          # zero) a structure must be on record to avoid empty institutional lots.
+          next if imp > 15000
+          next if imp <= 0 && !had_structure
+          own_inst = CLOSED_INST_OWNER_WORDS.any? { |w| owner.include?(" #{w} ") || owner.start_with?("#{w} ") || owner.end_with?(" #{w}") || owner.split(/[^A-Z]+/).include?(w) }
+          why = []
+          why << "institutional use: #{ctx[:use_desc]}" unless ctx[:use_desc].empty?
+          why << "public/inst. owner (#{ctx[:owner]})" if own_inst && !ctx[:owner].empty?
+          why << (imp <= 0 ? 'building on record but no assessed value' : "near-zero building value ($#{imp.round})")
+          out << { lat: cy.round(6), lng: cx.round(6), source: 'parcel', category: 'institution',
+                   kind: "former #{inst_specific}",
+                   name: (ctx[:site_addr].to_s.empty? ? nil : ctx[:site_addr]),
+                   state: 'value-collapsed', why: why.join(' · '),
+                   score: (had_structure ? 0.8 : 0.65) }
+        else # use_retail
+          n_retail += 1
+          # Retail value collapses less readily than institutional (an empty
+          # store is still a leasable asset), so the CLEAN signal here is the
+          # DEMOLISHED mall/store: a big retail-coded parcel whose building value
+          # has gone to ~zero with a structure on record. Use a tighter floor
+          # ($5k) and REQUIRE the structure flag, since a standing empty store
+          # keeps value and a zero-value retail parcel with no structure is just
+          # commercial land. This keeps retail high-precision (mostly demolished
+          # sites), which is the reliable retail signal.
+          next if imp > 5000
+          next unless had_structure
+          why = ["large-retail use: #{ctx[:use_desc]}"]
+          why << (imp <= 0 ? 'building on record but no assessed value (likely demolished)' : "near-zero building value ($#{imp.round})")
+          out << { lat: cy.round(6), lng: cx.round(6), source: 'parcel', category: 'retail',
+                   kind: "former #{retail_specific}",
+                   name: (ctx[:site_addr].to_s.empty? ? nil : ctx[:site_addr]),
+                   state: 'value-collapsed', why: why.join(' · '),
+                   score: 0.75 }
+        end
+      end
+      log.("Parcels scanned: #{n_inst} institutional + #{n_retail} large-retail; " \
+           "#{out.count { |o| o[:source] == 'parcel' }} with collapsed building value.")
+    rescue => e
+      log.("Parcel closed-institution signal skipped: #{e.message}")
+    end
+  end
+
+  # de-dupe across signals by proximity (OSM + parcel may both flag one site;
+  # merge into a single stronger candidate)
+  merged = []
+  out.sort_by { |o| -o[:score] }.each do |o|
+    near = merged.find { |m| haversine_m(o[:lat], o[:lng], m[:lat], m[:lng]) < 60 }
+    if near
+      near[:why] = "#{near[:why]} + #{o[:why]}"
+      near[:score] = [[near[:score] + 0.1, 1.2].min, near[:score]].max
+      near[:sources] = (near[:sources] || [near[:source]]) | [o[:source]]
+    else
+      o[:sources] = [o[:source]]
+      merged << o
+    end
+  end
+  merged.sort_by { |o| -o[:score] }
 end
 
 # Is (lng,lat) inside any industrial/railway polygon, or within ~60 m of a rail
@@ -652,6 +1280,11 @@ def zone_hit(zones, lng, lat)
   (zones[:polys] || []).each do |label, ring|
     return label if point_in_ring?(lng, lat, ring)
   end
+  # near an institutional point feature (church/community/sports node)? ~80 m
+  poi_tol = (80.0 / 111_320.0)
+  (zones[:pois] || []).each do |label, x, y|
+    return label if (x - lng).abs < poi_tol && (y - lat).abs < poi_tol
+  end
   # near a rail line? cheap check: distance to any rail vertex under ~60 m
   rail_tol = (60.0 / 111_320.0)  # ~60 m in degrees lat (approx; longitude close enough at test latitudes)
   (zones[:rails] || []).each do |line|
@@ -660,6 +1293,72 @@ def zone_hit(zones, lng, lat)
     end
   end
   nil
+end
+
+# Fetch OSM roads (named highways) for the box, so we can measure how far each
+# candidate sits from the nearest road and estimate a street address by
+# interpolation. Roadless structures deep in the woods are the high-interest
+# finds; and the nearest road name gives a reverse-geocode-style estimate.
+def osm_fetch_roads(box, key, log = NOOP_LOG)
+  Dir.mkdir(CACHE_DIR) unless Dir.exist?(CACHE_DIR)
+  rf = File.join(CACHE_DIR, "osm_roads_#{key}.json")
+  if File.exist?(rf)
+    log.('Roads: using cache')
+    return JSON.parse(File.read(rf), symbolize_names: true)
+  end
+  log.('Fetching road network from OpenStreetMap...')
+  bbox = "#{box[1]},#{box[0]},#{box[3]},#{box[2]}"
+  q = %{[out:json][timeout:120];(} +
+      %{way["highway"](#{bbox}););out geom;}
+  els = overpass(q)
+  roads = []   # [name_or_nil, [[lng,lat],...]]
+  els.each do |el|
+    g = el['geometry'] or next
+    pts = g.map { |pt| [pt['lon'], pt['lat']] }
+    next if pts.size < 2
+    tags = el['tags'] || {}
+    cls = tags['highway']
+    next if %w[footway path steps cycleway pedestrian bridleway corridor].include?(cls)
+    roads << [tags['name'], pts]
+  end
+  data = { roads: roads }
+  File.write(rf, JSON.generate(data))
+  log.("Roads fetched: #{roads.size} segments")
+  JSON.parse(JSON.generate(data), symbolize_names: true)
+end
+
+# Distance (m) from a point to a line segment, in local meters.
+def point_seg_dist_m(plng, plat, alng, alat, blng, blat, mlon)
+  ax = (alng - plng) * mlon; ay = (alat - plat) * M_LAT
+  bx = (blng - plng) * mlon; by = (blat - plat) * M_LAT
+  dx = bx - ax; dy = by - ay
+  seg2 = dx * dx + dy * dy
+  if seg2 < 1e-9
+    t = 0.0
+  else
+    t = -(ax * dx + ay * dy) / seg2
+    t = 0.0 if t < 0; t = 1.0 if t > 1
+  end
+  cx = ax + t * dx; cy = ay + t * dy
+  Math.sqrt(cx * cx + cy * cy)
+end
+
+# Nearest road to (lng,lat): returns [distance_m, road_name_or_nil].
+def nearest_road(roads_data, lng, lat, mlon)
+  return [nil, nil] unless roads_data && roads_data[:roads]
+  best = Float::INFINITY; bname = nil
+  win = 0.02
+  roads_data[:roads].each do |name, pts|
+    pts.each_cons(2) do |(alng, alat), (blng, blat)|
+      next if [alng, blng].min - win > lng || [alng, blng].max + win < lng
+      next if [alat, blat].min - win > lat || [alat, blat].max + win < lat
+      d = point_seg_dist_m(lng, lat, alng, alat, blng, blat, mlon)
+      if d < best
+        best = d; bname = name
+      end
+    end
+  end
+  best.finite? ? [best, bname] : [nil, nil]
 end
 
 def osm_fetch(box, log = NOOP_LOG)
@@ -722,26 +1421,112 @@ def nominatim_box(county, state)
 end
 
 # ----------------------------------------------------------------------------
-# ARCGIS REST LAYER FETCH (paged — services cap each response, so we walk
-# through with resultOffset until a short page signals the end)
+# ARCGIS REST LAYER FETCH (parallel paging)
+# Services cap each response, so we must page — but instead of walking pages one
+# slow request at a time, we ask the service for the total count and its max
+# page size up front, then fetch every page CONCURRENTLY (capped) with retries.
+# This turns hundreds of serial round-trips into a few parallel batches.
+# `fields` controls outFields (use '' for geometry-only address pulls to shrink
+# payloads); `simplify` requests generalized geometry (smaller, for parcels).
 # ----------------------------------------------------------------------------
-def arcgis_fetch(layer_url, box, log = NOOP_LOG, page = 2000)
+def arcgis_fetch(layer_url, box, log = NOOP_LOG, page = 2000, fields: '*', simplify: nil)
   env = box.join(',')
-  feats = []
-  offset = 0
-  loop do
-    q = "geometry=#{env}&geometryType=esriGeometryEnvelope&inSR=4326&outSR=4326" \
-        "&spatialRel=esriSpatialRelIntersects&where=1%3D1&outFields=*&f=geojson" \
+  base = "geometry=#{env}&geometryType=esriGeometryEnvelope&inSR=4326&outSR=4326" \
+         "&spatialRel=esriSpatialRelIntersects&where=1%3D1"
+  of = URI.encode_www_form_component(fields)
+  simp = simplify ? "&maxAllowableOffset=#{simplify}" : ''
+
+  # 1) total count (one tiny request) and the service's max page size. Try a
+  # few times — a transient miss here used to drop us to slow sequential paging.
+  count = nil
+  3.times do
+    begin
+      cj = http_get_json("#{layer_url}/query?#{base}&returnCountOnly=true&f=json")
+      count = cj['count']
+      break unless count.nil?
+    rescue
+      count = nil
+    end
+    sleep 1
+  end
+  # the layer's own maxRecordCount tells us the biggest page it will serve
+  begin
+    mj = http_get_json("#{layer_url}?f=json")
+    srv_max = (mj['maxRecordCount'] || mj['standardMaxRecordCount']).to_i
+    page = srv_max if srv_max && srv_max > page && srv_max <= 20000
+  rescue
+    # keep default page
+  end
+
+  fetch_page = lambda do |offset|
+    q = "#{base}&outFields=#{of}#{simp}&f=geojson" \
         "&resultRecordCount=#{page}&resultOffset=#{offset}"
     d = http_get_json("#{layer_url}/query?#{q}")
     raise "ArcGIS service error: #{d['error']}" if d['error']
-    batch = d['features'] || []
-    feats.concat(batch)
-    log.("  ...#{feats.size} features so far") if offset.positive?
-    break if batch.size < page
-    offset += page
+    d['features'] || []
   end
-  feats
+
+  pool = 14   # concurrent requests — fast but still polite to the service
+
+  # Unknown total — STILL fetch in parallel, just optimistically: pull pages in
+  # concurrent batches and stop once a batch comes back not-full (the end). This
+  # keeps the speed even when the count query is unavailable, instead of falling
+  # back to slow one-at-a-time paging.
+  if count.nil?
+    log.('  Fetching pages in parallel (probing for the end)...')
+    feats = []
+    base_off = 0
+    loop do
+      offs = (0...pool).map { |k| base_off + k * page }
+      parts = Array.new(pool)
+      threads = offs.each_with_index.map do |off, k|
+        Thread.new do
+          tries = 3
+          begin
+            parts[k] = fetch_page.call(off)
+          rescue
+            tries -= 1
+            tries > 0 ? (sleep 2; retry) : (parts[k] = [])
+          end
+        end
+      end
+      threads.each(&:join)
+      got = parts.compact
+      got.each { |b| feats.concat(b) }
+      log.("  ...#{feats.size} features so far")
+      # stop when the last page in this batch was short (no more data)
+      break if got.empty? || (got.last && got.last.size < page)
+      base_off += pool * page
+    end
+    return feats
+  end
+
+  return [] if count.zero?
+  log.("  #{count} features to fetch — pulling #{((count + page - 1) / page)} pages in parallel...")
+  offsets = (0...count).step(page).to_a
+  results = Array.new(offsets.size)
+  done = 0; mutex = Mutex.new
+
+  offsets.each_slice(pool) do |slice|
+    threads = slice.map do |off|
+      Thread.new(off) do |offset|
+        idx = offsets.index(offset)
+        tries = 3
+        begin
+          results[idx] = fetch_page.call(offset)
+        rescue
+          tries -= 1
+          if tries > 0 then sleep 2; retry else results[idx] = []; end
+        end
+        mutex.synchronize do
+          done += 1
+          log.("  ...#{done * page > count ? count : done * page} of #{count} features") if (done % 4).zero? || done == offsets.size
+        end
+      end
+    end
+    threads.each(&:join)
+  end
+  results.compact.flatten(1)
 end
 
 # ----------------------------------------------------------------------------
@@ -760,7 +1545,7 @@ def ncom_fetch(box, key, log = NOOP_LOG)
   log.('NC OneMap data: using cache') if cached
   unless cached
     log.('Fetching NC OneMap address points (911-grade)...')
-    addr = arcgis_fetch(NCOM_ADDR_LAYER, box, log)
+    addr = arcgis_fetch(NCOM_ADDR_LAYER, box, log, fields: '')
     afeats = addr.filter_map do |f|
       g = f['geometry']
       next unless g && g['type'] == 'Point'
@@ -771,11 +1556,15 @@ def ncom_fetch(box, key, log = NOOP_LOG)
 
     log.("Addresses fetched: #{afeats.size}")
     log.('Fetching NC OneMap parcels with assessed values...')
-    parcels = arcgis_fetch(NCOM_PARCEL_LAYER, box, log)
+    parcels = arcgis_fetch(NCOM_PARCEL_LAYER, box, log,
+                           fields: 'IMPROVVAL,parusecode,parusedesc,parusedsc2,owntype,ownname,gisacres,siteadd,struct,landval,parval',
+                           simplify: 0.00002)
     pfeats = parcels.filter_map do |f|
       g = f['geometry']
       next unless g && %w[Polygon MultiPolygon].include?(g['type'])
-      pr = f['properties'] || {}
+      raw = f['properties'] || {}
+      # ArcGIS may return field names in any case; index case-insensitively.
+      pr = {}; raw.each { |k, v| pr[k.to_s.downcase] = v }
       improv = pr['improvval']
       # Data-quality guard: some NC counties publish only a TOTAL parcel
       # value (parval) and leave improvval/landval at 0. There, a zero
@@ -817,7 +1606,7 @@ def nad_fetch(box, key, log = NOOP_LOG)
     return [ad_file, true]
   end
   log.('Fetching National Address Database points...')
-  addr = arcgis_fetch(NAD_LAYER, box, log)
+  addr = arcgis_fetch(NAD_LAYER, box, log, fields: '')
   afeats = addr.filter_map do |f|
     g = f['geometry']
     next unless g && g['type'] == 'Point'
@@ -1519,11 +2308,30 @@ def calibrate_only(cfg, log = NOOP_LOG)
   aindex = GridIndex.new(probe, mlon)
   addresses.each { |g, t| aindex.insert(g, t) }
 
-  log.('Measuring nearest-address distance for every building...')
+  # Filter to buildings in the size range, then SAMPLE. Calibration measures a
+  # distance DISTRIBUTION — a few thousand buildings give percentiles
+  # statistically identical to measuring tens of thousands, but far faster. We
+  # sample evenly across the (spatially-ordered) list so the sample stays
+  # geographically representative rather than clustered.
+  calib_sample = 3000
+  candidates_r = rings.select do |r|
+    a = ring_area_centroid(r, mlon)[0]
+    a >= cfg[:min_area] && a <= cfg[:max_area]
+  end
+  total_in_range = candidates_r.size
+  if candidates_r.size > calib_sample
+    stride = candidates_r.size.to_f / calib_sample
+    sampled = (0...calib_sample).map { |i| candidates_r[(i * stride).to_i] }
+    log.("Measuring nearest-address distance — sampling #{calib_sample} of " \
+         "#{total_in_range} buildings (statistically representative, much faster)...")
+  else
+    sampled = candidates_r
+    log.("Measuring nearest-address distance for #{sampled.size} buildings...")
+  end
+
   dists = []
-  rings.each do |r|
+  sampled.each do |r|
     area, lng, lat = ring_area_centroid(r, mlon)
-    next if area < cfg[:min_area] || area > cfg[:max_area]
     best = Float::INFINITY
     # search outward in rings up to ~5 cells (≈375 m) for a robust nearest
     (0..5).each do |ring_n|
@@ -1550,9 +2358,10 @@ def calibrate_only(cfg, log = NOOP_LOG)
   bands = Array.new(11, 0)
   s_all.each { |d| bands[[(d / 10).floor, 10].min] += 1 }
   log.("Pre-calibration complete: #{s_all.size} buildings measured " \
-       "(#{registered.size} with an address within 100 m).")
+       "(#{registered.size} with an address within 100 m)" \
+       "#{total_in_range > s_all.size ? " — sampled from #{total_in_range} in range" : ''}.")
   {
-    n: s_all.size, n_registered: registered.size,
+    n: s_all.size, n_registered: registered.size, n_total: total_in_range,
     p50: pct.call(basis, 50).round(1), p90: pct.call(basis, 90).round(1),
     p95: pct.call(basis, 95).round(1), p99: pct.call(basis, 99).round(1),
     max: basis.last.round(1), threshold: cfg[:threshold].to_i, bands: bands
@@ -1583,6 +2392,7 @@ def run_vector(cfg, log = NOOP_LOG)
   end
 
   zones = cfg[:zones]   # OSM industrial/railway zones, if fetched
+  roads = cfg[:roads]   # OSM road network, if fetched
   dismissed = load_dismissed
 
   aindex = GridIndex.new(cfg[:threshold], mlon)
@@ -1628,7 +2438,10 @@ def run_vector(cfg, log = NOOP_LOG)
               elsif pr then (pr[1].is_a?(Numeric) ? pr[1] : nil)
               else :no_parcel end
     improvement = pr.nil? ? 'no_parcel' : (imp_val.nil? ? 'field_missing' : imp_val.round)
-    use_flag = parcel_use_flag(pctx)   # non-residential use description, or nil
+    use_cls = parcel_use_class(pctx)         # [label, :industrial|:institutional] or nil
+    use_flag = use_cls ? use_cls[0] : nil
+    use_cat = use_cls ? use_cls[1] : nil
+    org_owner = org_owner_flag(pctx)         # 'organization-owned' or nil
 
     nbrs = 0
     dindex.each_near(lng, lat) do |g, t|
@@ -1669,13 +2482,21 @@ def run_vector(cfg, log = NOOP_LOG)
     in_zone = zone_hit(zones, lng, lat) if zones
     next if cfg[:reject_zones] && in_zone
 
+    # Institutional/civic/religious uses (churches, rec centers, clubs, schools)
+    # match the "no nearby address" signature for innocent reasons. Optionally
+    # reject them outright; otherwise they're flagged and sunk below.
+    next if cfg[:reject_institutional] && (use_cat == :institutional || org_owner)
+
     s_iso = nearest_m ? [nearest_m / cfg[:max_search], 1.0].min : 1.0
     s_par = imp_val.is_a?(Numeric) ? (imp_val <= 0 ? 1.0 : 0.0) : 0.5
     s_den = [(10 - nbrs) / 10.0, 0.0].max
     score = 0.40 * s_iso + 0.35 * s_par + 0.25 * s_den
-    # context penalties: industrial use, dense cluster, or zone membership all
-    # make a "hidden structure" far less likely — push these down the ranking
-    score -= 0.25 if use_flag
+    # context penalties: industrial/institutional use, dense cluster, zone
+    # membership, or organization ownership all make a "hidden structure" far
+    # less likely — push these down the ranking
+    score -= 0.25 if use_cat == :industrial
+    score -= 0.30 if use_cat == :institutional
+    score -= 0.15 if org_owner
     score -= 0.20 if in_zone
     score -= [cluster_n * 0.02, 0.20].min
     score = 0.0 if score < 0
@@ -1689,18 +2510,61 @@ def run_vector(cfg, log = NOOP_LOG)
     cls = classify_footprint(ring_m, area, perim)
     glyph = shape_glyph_svg(ring_m, cls[:long], cls[:short])
 
+    # Shape search. Spec filter: drop candidates whose shape family / aspect
+    # doesn't match the requested spec. Target match: rank by how closely the
+    # footprint matches a pasted outline (rotation/scale/reflection invariant).
+    rect_m = min_area_rect(ring_m, area)
+    elong_m = rect_m ? rect_m[:elong] : 1.0
+    if cfg[:shape_spec] && cfg[:shape_spec] != 'any'
+      fam = cls[:shape].to_s
+      want = cfg[:shape_spec]
+      ok = case want
+           when 'rectangle'      then %w[rectangle long rectangle square blocky].include?(fam)
+           when 'square'         then fam == 'square'
+           when 'long'           then fam == 'long rectangle' || fam == 'elongated' || elong_m >= 3.0
+           when 'lshape'         then fam == 'L / T-shaped'
+           when 'circular'       then fam == 'circular'
+           when 'irregular'      then fam == 'irregular'
+           else true
+           end
+      next unless ok
+    end
+    next if cfg[:shape_aspect_min] && elong_m < cfg[:shape_aspect_min]
+    next if cfg[:shape_aspect_max] && elong_m > cfg[:shape_aspect_max]
+
+    shape_match = nil
+    if cfg[:shape_target]
+      sig = shape_signature(ring_m, area, perim)
+      dist = shape_distance(cfg[:shape_target][:sig], sig)
+      shape_match = shape_match_pct(dist)
+      next if cfg[:shape_min_match] && shape_match < cfg[:shape_min_match]
+    end
+
     # Build a short "accuracy notes" string summarizing context signals so the
     # user can judge each hit. Positive signals (isolated, no improvement value)
     # and warning signals (industrial use, cluster, zone) both surface here.
     notes = []
-    notes << "use: #{use_flag}" if use_flag
+    notes << "use: #{use_flag}#{use_cat == :institutional ? ' (civic)' : ''}" if use_flag
     notes << "in #{in_zone}" if in_zone
+    notes << org_owner if org_owner
     notes << "#{cluster_n} bldgs within #{crad.to_i}m" if cluster_n >= 3
     notes << 'big parcel' if pctx && pctx[:acres].to_f >= 20
     notes << "owner: #{pctx[:owner_type]}" if pctx && !pctx[:owner_type].empty? &&
                                               pctx[:owner_type].upcase !~ /\A(PRIV|INDIV|PERSON)/
-    flagged = !(use_flag.nil? && in_zone.nil?) || cluster_n >= 5
+    flagged = !use_flag.nil? || !in_zone.nil? || !org_owner.nil? || cluster_n >= 5
     dm = dismissed_match(dismissed, lat, lng)
+
+    # Road distance + estimated address (reverse-geocode style) if roads fetched.
+    road_dist = nil; est_addr = ''
+    if roads
+      rd, rname = nearest_road(roads, lng, lat, mlon)
+      if rd
+        road_dist = rd.round
+        est_addr = rname ? "~#{rname}" : '(unnamed road)'
+        notes << "#{road_dist}m to road" if road_dist >= 150
+        flagged = true if road_dist >= 300   # genuinely roadless = notable
+      end
+    end
 
     out << { lat: lat.round(6), lng: lng.round(6), area_m2: area.round(1),
              nearest_address_m: nearest_m ? nearest_m.round(1) : ">#{cfg[:max_search].to_i}",
@@ -1710,11 +2574,13 @@ def run_vector(cfg, log = NOOP_LOG)
              site_addr: (pctx ? pctx[:site_addr] : ''),
              notes: notes.join(' · '),
              flagged: flagged,
+             road_dist: road_dist, est_addr: est_addr,
              dismissed: !dm.nil?, dismiss_reason: (dm ? dm[:reason].to_s : ''),
              shape: shp ? "circ #{shp[:circularity].round(2)}" : 'n/a',
              shape_class: cls[:shape], likely_type: cls[:type],
              dim: (cls[:long] && cls[:short] ? "#{cls[:long].round}×#{cls[:short].round}m" : ''),
              glyph: glyph,
+             shape_match: shape_match,
              tank: tank,
              score: score.round(3) }
   end
@@ -1732,7 +2598,12 @@ def run_vector(cfg, log = NOOP_LOG)
   ndis = out.count { |c| c[:dismissed] }
   log.("Skipping #{ndis} dismissed location#{ndis == 1 ? '' : 's'}") if ndis > 0
   log.("Join complete: #{out.size} candidates")
-  out.sort_by! { |c| [c[:dismissed] ? 1 : 0, c[:tank] ? 1 : 0, -c[:score]] }
+  if cfg[:shape_target]
+    # ranking by shape similarity to the pasted target outline
+    out.sort_by! { |c| [c[:dismissed] ? 1 : 0, -(c[:shape_match] || 0)] }
+  else
+    out.sort_by! { |c| [c[:dismissed] ? 1 : 0, c[:tank] ? 1 : 0, -c[:score]] }
+  end
   write_outputs(out, 'candidates')
 
   # Calibration: where do registered buildings' nearest-address distances fall?
@@ -1778,7 +2649,26 @@ def run_lidar(cfg, suppress, log = NOOP_LOG)
   log.("Grid: #{grid[:ncols]}x#{grid[:nrows]} cells — detecting blobs...")
   ncols, nrows = grid[:ncols], grid[:nrows]
   data, nodata = grid[:data], grid[:nodata]
-  lo, hi = cfg[:l_minh], cfg[:l_maxh]
+
+  # Ruins / foundations mode: abandoned structures and foundation-only ruins are
+  # LOW (a slab, low walls, a raised pad — roughly 0.2–1.8 m), not wall-height
+  # like a standing building. Retune the height window down, allow a little more
+  # roughness (rubble), and lean on rectangularity for the "man-made" call. This
+  # finds the "records say house, ground says foundation" case the address scan
+  # is blind to — and it ignores addresses entirely.
+  ruins = cfg[:ruins_mode]
+  if ruins
+    lo = 0.25; hi = 1.8
+    rough_cap = [cfg[:l_rough], 0.9].max
+    min_area = [cfg[:l_min_area], 12.0].min   # foundations can be small
+    max_area = cfg[:l_max_area]
+    log.('Hunt mode: ABANDONED / RUINS — low foundation-height features (0.25–1.8 m), ' \
+         'address-independent. Rectangular low pads are the signal.')
+  else
+    lo, hi = cfg[:l_minh], cfg[:l_maxh]
+    rough_cap = cfg[:l_rough]
+    min_area = cfg[:l_min_area]; max_area = cfg[:l_max_area]
+  end
 
   mid_lat = grid[:yll] + nrows * grid[:cell] / 2.0
   mlon = m_lon(mid_lat)
@@ -1786,6 +2676,7 @@ def run_lidar(cfg, suppress, log = NOOP_LOG)
 
   visited = Array.new(ncols * nrows, false)
   dismissed = load_dismissed
+  roads = cfg[:roads]   # OSM road network, if fetched
   blobs = []
   (0...nrows).each do |row|
     (0...ncols).each do |col|
@@ -1818,7 +2709,7 @@ def run_lidar(cfg, suppress, log = NOOP_LOG)
     mean = heights.sum / heights.size
     rough = Math.sqrt(heights.sum { |h| (h - mean)**2 } / heights.size)
     area = blob.size * cell_area
-    next if area < cfg[:l_min_area] || area > cfg[:l_max_area] || rough > cfg[:l_rough]
+    next if area < min_area || area > max_area || rough > rough_cap
 
     rc = blob.map { |i| i.divmod(ncols) }
     crow = rc.sum(&:first).to_f / blob.size
@@ -1843,24 +2734,55 @@ def run_lidar(cfg, suppress, log = NOOP_LOG)
     tank = lone_circle?(shp)
     dm = dismissed_match(dismissed, lat, lng)
     cls = classify_footprint(pts_m, area, perim)
-    # refine the type with roof form from the height data, and keep the roof label
-    refined_type, roof = refine_type_with_roof(cls, area, mean, rough)
+
+    if ruins
+      # A low feature that is RECTANGULAR / REGULAR is almost certainly man-made
+      # (a foundation, slab, or pad). A low IRREGULAR blob is most likely natural
+      # ground — a mound, bank, or brush clump — so drop it. Rectangularity is
+      # the key discriminator when height can't help.
+      reg = shp && shp[:solidity] >= 0.78
+      rectish = %w[square rectangle long rectangle blocky L / T-shaped].include?(cls[:shape])
+      next unless reg && (rectish || cls[:shape] == 'circular')
+      # describe by height: a true slab/pad is very low; low walls a bit taller
+      ruin_type =
+        if mean < 0.6 then 'foundation / slab (low pad)'
+        elsif mean < 1.2 then 'foundation / low walls'
+        else 'partial / collapsing structure'
+        end
+      refined_type = ruin_type
+      roof = ''
+    else
+      # standing-structure mode: refine type with roof form from height data
+      refined_type, roof = refine_type_with_roof(cls, area, mean, rough)
+    end
     # LiDAR blobs are a set of grid cells, not an ordered ring — draw the convex
     # hull outline so the glyph still reads as a clean shape.
     glyph = shape_glyph_svg(convex_hull(pts_m), cls[:long], cls[:short])
+
+    road_dist = nil; est_addr = ''
+    if roads
+      rd, rname = nearest_road(roads, lng, lat, mlon)
+      if rd
+        road_dist = rd.round
+        est_addr = rname ? "~#{rname}" : '(unnamed road)'
+      end
+    end
 
     out << { lat: lat.round(6), lng: lng.round(6), area_m2: area.round(1),
              mean_height_m: mean.round(2), roughness_m: rough.round(2),
              shape: shp ? "circ #{shp[:circularity].round(2)}" : 'n/a',
              shape_class: cls[:shape], likely_type: refined_type, roof: roof,
              dim: (cls[:long] && cls[:short] ? "#{cls[:long].round}×#{cls[:short].round}m" : ''),
-             glyph: glyph,
+             glyph: glyph, ruin: ruins,
+             road_dist: road_dist, est_addr: est_addr,
              dismissed: !dm.nil?, dismiss_reason: (dm ? dm[:reason].to_s : ''),
              tank: tank }
   end
-  out.reject! { |c| c[:tank] } if cfg[:hide_tanks]
+  out.reject! { |c| c[:tank] } if cfg[:hide_tanks] && !ruins
   out.reject! { |c| c[:dismissed] } if cfg[:hide_dismissed]
-  log.("LiDAR complete: #{out.size} flat elevated blobs unknown to footprints")
+  log.(ruins ?
+    "Ruins scan complete: #{out.size} low rectangular features (possible foundations / ruins)" :
+    "LiDAR complete: #{out.size} flat elevated blobs unknown to footprints")
   out.sort_by! { |c| [c[:dismissed] ? 1 : 0, c[:tank] ? 1 : 0, c[:roughness_m]] }
   write_outputs(out, 'lidar_candidates')
   out
@@ -2067,6 +2989,68 @@ PICKER_JS = <<~'JS'
       row.parentNode.removeChild(row);
     }).catch(function () { btn.disabled = false; btn.textContent = 'restore'; });
   };
+
+  // ===== Saved places: archive a find to investigate further =====
+  window.saveCand = function (btn) {
+    var row = btn.closest('tr');
+    var lat = row.getAttribute('data-lat'), lng = row.getAttribute('data-lng');
+    var note = window.prompt(
+      'Save this place to your investigation archive.\nOptional note (e.g. "possible old homestead — check deed") — or leave blank:', '');
+    if (note === null) return; // cancelled
+    btn.disabled = true; btn.textContent = '…';
+    postForm('/save', {
+      lat: lat, lng: lng, note: note,
+      label: row.getAttribute('data-label') || '',
+      shape: row.getAttribute('data-shape') || '',
+      info: row.getAttribute('data-info') || '',
+      mode: row.getAttribute('data-mode') || ''
+    }).then(function () {
+      btn.outerHTML = "<button type='button' class='save-btn saved' onclick='unsaveCand(this)' title='Saved — click to remove'>\u2605 saved</button>";
+    }).catch(function () { btn.disabled = false; btn.innerHTML = '\u2606 save'; });
+  };
+  window.unsaveCand = function (btn) {
+    var row = btn.closest('tr');
+    var lat = row.getAttribute('data-lat'), lng = row.getAttribute('data-lng');
+    btn.disabled = true; btn.textContent = '…';
+    postForm('/unsave', { lat: lat, lng: lng }).then(function () {
+      btn.outerHTML = "<button type='button' class='save-btn' onclick='saveCand(this)' title='Save to investigate later'>\u2606 save</button>";
+    }).catch(function () { btn.disabled = false; btn.innerHTML = '\u2605 saved'; });
+  };
+  // remove from the Saved-places review panel (drops the row)
+  window.unsavePanel = function (btn) {
+    var row = btn.closest('tr');
+    var lat = row.getAttribute('data-lat'), lng = row.getAttribute('data-lng');
+    btn.disabled = true; btn.textContent = '…';
+    postForm('/unsave', { lat: lat, lng: lng }).then(function () {
+      row.parentNode.removeChild(row);
+    }).catch(function () { btn.disabled = false; btn.textContent = 'remove'; });
+  };
+  // edit the note on a saved place from the review panel
+  window.editSavedNote = function (btn) {
+    var row = btn.closest('tr');
+    var lat = row.getAttribute('data-lat'), lng = row.getAttribute('data-lng');
+    var cell = row.querySelector('.saved-note');
+    var current = cell ? cell.getAttribute('data-note') || '' : '';
+    var note = window.prompt('Edit note for this saved place:', current);
+    if (note === null) return;
+    btn.disabled = true;
+    postForm('/save/note', { lat: lat, lng: lng, note: note }).then(function () {
+      if (cell) {
+        cell.setAttribute('data-note', note);
+        cell.innerHTML = note ? note.replace(/[<>&]/g, '') : "<span class='muted'>— no note —</span>";
+      }
+      btn.disabled = false;
+    }).catch(function () { btn.disabled = false; });
+  };
+  window.clearSaved = function (btn) {
+    if (!window.confirm('Clear your entire saved-places archive? This cannot be undone.')) return;
+    btn.disabled = true; btn.textContent = '…';
+    postForm('/saved/clear', {}).then(function () {
+      var fs = btn.closest('fieldset');
+      if (fs) fs.style.opacity = '.4';
+      btn.textContent = 'archive cleared \u2713';
+    }).catch(function () { btn.disabled = false; btn.textContent = 'Clear archive'; });
+  };
   window.clearExamined = function (btn) {
     btn.disabled = true; btn.textContent = '…';
     postForm('/examined/clear', {}).then(function () {
@@ -2074,6 +3058,146 @@ PICKER_JS = <<~'JS'
       btn.textContent = 'sweep reset \u2713';
     }).catch(function () { btn.disabled = false; btn.textContent = 'Reset sweep progress'; });
   };
+
+  // ===== Shape search: preset buttons + click-to-sketch pad =====
+  (function () {
+    var ta = document.getElementById('shapeTarget');
+    var pad = document.getElementById('sketchPad');
+    if (!ta) return;
+
+    // build a regular polygon's points string (used by the "Round" preset)
+    function circlePts(n, cx, cy, r) {
+      var out = [];
+      for (var i = 0; i < n; i++) {
+        var a = (i / n) * Math.PI * 2;
+        out.push((cx + r * Math.cos(a)).toFixed(1) + ',' + (cy + r * Math.sin(a)).toFixed(1));
+      }
+      return out.join(' ');
+    }
+
+    var V = 400;   // square viewBox edge — X and Y scale identically, no squashing
+
+    // fit an arbitrary set of points into the pad's drawable area (centered)
+    function fitToPad(pre) {
+      if (pre.length < 1) return [];
+      var xs = pre.map(function (p) { return p[0]; });
+      var ys = pre.map(function (p) { return p[1]; });
+      var minx = Math.min.apply(null, xs), maxx = Math.max.apply(null, xs);
+      var miny = Math.min.apply(null, ys), maxy = Math.max.apply(null, ys);
+      var w = (maxx - minx) || 1, h = (maxy - miny) || 1;
+      var pad_m = V * 0.14;                       // margin
+      var draw = V - pad_m * 2;
+      var sc = Math.min(draw / w, draw / h);      // uniform scale keeps proportions
+      var ox = (V - w * sc) / 2, oy = (V - h * sc) / 2;
+      // textarea uses Y-up, pad uses Y-down — flip here
+      return pre.map(function (p) {
+        return [ox + (p[0] - minx) * sc, V - (oy + (p[1] - miny) * sc)];
+      });
+    }
+
+    // preset buttons fill the textarea (and draw into the pad)
+    document.querySelectorAll('.preset-btn').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var s = b.getAttribute('data-shape');
+        if (s === 'circle') s = circlePts(28, 0, 0, 100);
+        ta.value = s;
+        sketchPoints = fitToPad(parsePairs(s));
+        redrawSketch();
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+    });
+
+    // ---- sketch pad ----
+    var sketchPoints = [];        // [[x,y],...] in viewBox units (0..V, 0..V)
+    var NS = 'http://www.w3.org/2000/svg';
+
+    function parsePairs(str) {
+      var nums = (str.match(/-?\d+\.?\d*/g) || []).map(Number);
+      var pts = [];
+      for (var i = 0; i + 1 < nums.length; i += 2) pts.push([nums[i], nums[i + 1]]);
+      return pts;
+    }
+
+    // write the current sketch points back to the textarea (rounded, tidy)
+    function syncToTextarea() {
+      if (!sketchPoints.length) { ta.value = ''; }
+      else {
+        ta.value = sketchPoints.map(function (p) {
+          return p[0].toFixed(1) + ',' + (V - p[1]).toFixed(1);  // flip Y so up = up
+        }).join('  ');
+      }
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function redrawSketch() {
+      if (!pad) return;
+      while (pad.firstChild) pad.removeChild(pad.firstChild);
+      var pts = sketchPoints;
+      if (!pts.length) return;
+      // closed polygon outline
+      var poly = document.createElementNS(NS, 'polygon');
+      poly.setAttribute('points', pts.map(function (p) { return p[0] + ',' + p[1]; }).join(' '));
+      poly.setAttribute('fill', 'rgba(240,168,48,0.18)');
+      poly.setAttribute('stroke', '#f0a830');
+      poly.setAttribute('stroke-width', '2.5');
+      poly.setAttribute('stroke-linejoin', 'round');
+      pad.appendChild(poly);
+      // corner dots, first one highlighted (radii in viewBox units -> round)
+      pts.forEach(function (p, i) {
+        var c = document.createElementNS(NS, 'circle');
+        c.setAttribute('cx', p[0]); c.setAttribute('cy', p[1]);
+        c.setAttribute('r', i === 0 ? 7 : 5.5);
+        c.setAttribute('fill', i === 0 ? '#46d39a' : '#f0a830');
+        c.setAttribute('stroke', '#0e1115'); c.setAttribute('stroke-width', '2');
+        pad.appendChild(c);
+      });
+    }
+
+    // map a pointer event to viewBox coordinates. Because the SVG uses
+    // preserveAspectRatio="xMidYMid meet" on a square box in a square element,
+    // the rect IS square, so x and y map identically — no distortion.
+    function evtToPad(e) {
+      var r = pad.getBoundingClientRect();
+      var cx = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
+      var cy = (e.touches ? e.touches[0].clientY : e.clientY) - r.top;
+      return [Math.max(0, Math.min(V, cx / r.width * V)),
+              Math.max(0, Math.min(V, cy / r.height * V))];
+    }
+
+    if (pad) {
+      // if the textarea already has content on load, show it in the pad
+      if (ta.value.trim()) {
+        var pre0 = parsePairs(ta.value);
+        if (pre0.length >= 3) { sketchPoints = fitToPad(pre0); redrawSketch(); }
+      }
+      var addPoint = function (e) {
+        e.preventDefault();
+        sketchPoints.push(evtToPad(e));
+        redrawSketch();
+        syncToTextarea();
+      };
+      pad.addEventListener('click', addPoint);
+      pad.addEventListener('touchstart', addPoint, { passive: false });
+
+      var undo = document.getElementById('sketchUndo');
+      var clr = document.getElementById('sketchClear');
+      if (undo) undo.addEventListener('click', function () {
+        sketchPoints.pop(); redrawSketch(); syncToTextarea();
+      });
+      if (clr) clr.addEventListener('click', function () {
+        sketchPoints = []; redrawSketch(); ta.value = '';
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+
+      // resize control — changes the pad's on-screen size (stays square)
+      var sz = document.getElementById('sketchSize');
+      if (sz) {
+        var applySize = function () { pad.style.maxWidth = sz.value + 'px'; };
+        sz.addEventListener('change', applySize);
+        applySize();
+      }
+    }
+  })();
   </script>
 JS
 
@@ -2491,17 +3615,54 @@ PAGE_HEAD = <<~'HTML'
       tr.tankrow { opacity:0.5; font-style:italic; }
       tr.flagrow td { background:rgba(255,106,43,.08); }
       tr.flagrow .notes-cell { color:var(--flag); }
+      .ci-badge { font-size:10px; font-weight:700; padding:2px 7px; border-radius:4px;
+                  letter-spacing:.04em; text-transform:uppercase; }
+      .ci-cat { font-size:10.5px; font-weight:700; padding:2px 7px; border-radius:4px;
+                white-space:nowrap; }
+      .ci-cat-institution { background:rgba(127,199,255,.14); color:#9ecbf0; border:1px solid #3a5e7a; }
+      .ci-cat-retail { background:rgba(240,168,48,.14); color:#f0b95c; border:1px solid #7a5a1e; }
+      .ci-OSM, .ci-osm { background:rgba(127,199,255,.18); color:#7fc7ff; border:1px solid #3a5e7a; }
+      .ci-parcel { background:rgba(240,168,48,.16); color:var(--amber); border:1px solid #7a5a1e; }
+      .ci-both { background:rgba(70,211,154,.18); color:var(--signal); border:1px solid #2c7a55; }
+      .ci-name { display:block; font-size:11px; color:var(--ink-dim); font-style:italic; }
+      .ci-state { font-size:11px; color:#ff9d5c; font-weight:700; }
+      .ci-conf { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+      .ci-strong { color:var(--signal); }
+      .ci-good { color:var(--amber); }
+      .ci-possible { color:var(--ink-dim); }
       tr.disrow td { opacity:.42; }
       tr.disrow .actcell { opacity:1; }
       .distag { color:var(--ink-dim); font-style:italic; font-size:11.5px; }
       .actcell { text-align:center; white-space:nowrap; }
+      /* stack the save + dismiss buttons vertically so both stay on-screen */
+      .actcell { display:flex; flex-direction:column; gap:4px; align-items:stretch;
+                 min-width:74px; }
       .dismiss-btn {
-        font:inherit; font-size:10.5px; letter-spacing:.08em; text-transform:uppercase;
+        font:inherit; font-size:10px; letter-spacing:.06em; text-transform:uppercase;
         color:var(--ink-dim); background:linear-gradient(180deg,var(--steel-3),var(--steel-2));
-        border:1px solid var(--line); border-radius:5px; padding:4px 9px; cursor:pointer;
+        border:1px solid var(--line); border-radius:5px; padding:4px 7px; cursor:pointer;
+        text-align:center;
       }
       .dismiss-btn:hover { color:var(--flag); border-color:var(--flag); }
       .dismiss-btn.restore:hover { color:var(--signal); border-color:var(--signal); }
+      .save-btn {
+        font:inherit; font-size:10px; letter-spacing:.06em; text-transform:uppercase;
+        color:var(--amber); background:linear-gradient(180deg,var(--steel-3),var(--steel-2));
+        border:1px solid var(--line); border-radius:5px; padding:4px 7px; cursor:pointer;
+        white-space:nowrap; text-align:center;
+      }
+      .save-btn:hover { color:#ffd27f; border-color:var(--amber); }
+      .save-btn.saved { color:var(--signal); border-color:#2c7a55;
+                        background:linear-gradient(180deg,rgba(70,211,154,.14),rgba(70,211,154,.06)); }
+      .save-btn.saved:hover { color:var(--flag); border-color:var(--flag); }
+      .saved-note { font-size:11.5px; color:var(--ink); max-width:280px; }
+      .saved-note .muted { color:var(--ink-dim); font-style:italic; }
+      .saved-meta { font-size:10.5px; color:var(--ink-dim); }
+      .saved-meta .sv-mode { color:var(--amber); }
+      .saved-export { display:inline-block; font-size:11px; color:var(--signal);
+                      border:1px solid #2c7a55; border-radius:5px; padding:4px 10px;
+                      text-decoration:none; margin-right:8px; }
+      .saved-export:hover { background:rgba(70,211,154,.1); }
       .notes-cell { font-size:11.5px; color:var(--ink-dim); max-width:240px; }
       .shapecell { display:flex; align-items:center; gap:9px; min-width:170px; }
       .shapecell .glyph { flex:0 0 auto; background:#11141a; border:1px solid var(--line);
@@ -2511,6 +3672,12 @@ PAGE_HEAD = <<~'HTML'
       .shapetxt .dim { color:var(--signal); font-variant-numeric:tabular-nums; font-size:10.5px; }
       .shapetxt .ltype { color:var(--amber); font-size:10.5px; }
       .shapetxt .roof { color:#7fc7ff; font-size:10px; font-style:italic; }
+      .shapetxt .ruintype { color:#ff9d5c; font-size:10.5px; font-weight:700; }
+      .shapetxt .smatch { color:var(--signal); font-size:10.5px; font-weight:700; }
+      .loc-cell { line-height:1.3; }
+      .loc-cell .roadinfo { display:block; font-size:10px; color:var(--ink-dim); }
+      .loc-cell .roadinfo.roadfar { color:var(--signal); font-weight:700; }
+      .loc-cell .estaddr { display:block; font-size:10px; color:#7fc7ff; font-style:italic; }
       /* collapsible panels: hidden until the summary is clicked */
       details.collapse > summary {
         cursor:pointer; list-style:none; user-select:none;
@@ -2548,7 +3715,7 @@ PAGE_HEAD = <<~'HTML'
       .ndsmwrap:active { cursor:grabbing; }
       .ndsmpane { transform-origin:0 0; position:relative; }
       .ndsmcanvas { position:absolute; left:0; top:0; width:100%; height:100%;
-                    display:none; image-rendering:pixelated; }
+                    display:none; image-rendering:auto; }
       .ndsmwrap.live-on .ndsmimg { visibility:hidden; }
       .ndsmwrap.live-on .ndsmcanvas { display:block; }
       .reliefbar { position:absolute; left:0; right:0; bottom:0; z-index:5;
@@ -2592,7 +3759,7 @@ PAGE_HEAD = <<~'HTML'
                        background:linear-gradient(180deg,var(--steel-3),var(--steel-2)); color:var(--amber); border:1px solid var(--steel-line);
                        border-radius:3px; }
       .r-zoom button:hover { background:var(--steel-3); }
-      .ndsmimg { width:100%; display:block; image-rendering:pixelated;
+      .ndsmimg { width:100%; display:block; image-rendering:auto;
                  user-select:none; -webkit-user-drag:none; }
       .mklayer { position:absolute; inset:0; pointer-events:none; }
       .mk { position:absolute; width:0; height:0; transform-origin:0 0;
@@ -2621,6 +3788,34 @@ PAGE_HEAD = <<~'HTML'
                  margin-top:8px; }
       textarea { font:inherit; font-size:12px; padding:7px 9px;
                  border:1px solid var(--ink); background:linear-gradient(180deg,#14171c,#1b1f25); color:var(--signal); width:100%; }
+      /* shape search tools: preset buttons + sketch pad */
+      .shape-tools { margin:6px 0 8px; }
+      .shape-presets { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:10px; }
+      .presets-label { font-size:11px; color:var(--ink-dim); letter-spacing:.05em; }
+      .preset-btn { font:inherit; font-size:11.5px; cursor:pointer; padding:5px 9px;
+                    border:1px solid var(--line); border-radius:6px; color:var(--amber);
+                    background:linear-gradient(180deg,var(--steel-3),var(--steel-2));
+                    width:auto; font-weight:400; letter-spacing:normal; text-transform:none;
+                    box-shadow:none; }
+      .preset-btn:hover { border-color:var(--amber); background:linear-gradient(180deg,#2a2f37,#21262d); }
+      .sketch-wrap { border:1px solid var(--line); border-radius:8px; padding:9px;
+                     background:#0e1115; }
+      .sketch-head { display:flex; justify-content:space-between; align-items:center;
+                     font-size:11px; color:var(--ink-dim); margin-bottom:6px; gap:8px; }
+      .sketch-actions { display:flex; gap:6px; }
+      .sketch-btn { font:inherit; font-size:10.5px; cursor:pointer; padding:3px 8px;
+                    border:1px solid var(--line); border-radius:5px; color:var(--ink-dim);
+                    background:var(--steel-2); width:auto; font-weight:400;
+                    letter-spacing:normal; text-transform:none; box-shadow:none; }
+      .sketch-btn:hover { border-color:var(--amber); color:var(--amber); }
+      #sketchPad { width:100%; max-width:280px; aspect-ratio:1 / 1; height:auto;
+                   display:block; margin:0 auto; border-radius:5px; border:1px solid var(--line);
+                   background:repeating-linear-gradient(0deg,#11151a 0,#11151a 23px,#171c22 23px,#171c22 24px),
+                              repeating-linear-gradient(90deg,#11151a 0,#11151a 23px,#171c22 23px,#171c22 24px);
+                   cursor:crosshair; touch-action:none; }
+      .sketch-size { font-size:10.5px; color:var(--ink-dim); display:inline-flex;
+                     align-items:center; gap:4px; }
+      .sketch-size select { width:auto; padding:2px 4px; font-size:10.5px; }
       .mkv .mkbub { background:rgba(212,85,31,.92); }
       .mkl .mkbub { background:rgba(62,92,73,.95); }
       .mkbub { pointer-events:auto; cursor:pointer; }
@@ -2658,7 +3853,7 @@ PAGE_HEAD = <<~'HTML'
     <header>
       <h1>Structure Hunter <span class="quad">// survey console</span></h1>
       <div class="tagline">(Finding hidden, forgotten or otherwise known or unknown abandoned structures)</div>
-      <div style="text-align:center;font-size:10px;color:var(--ink-dim);letter-spacing:.1em;margin-top:2px">build v47-roof-shape</div>
+      <div style="text-align:center;font-size:10px;color:var(--ink-dim);letter-spacing:.1em;margin-top:2px">build v63-compact-actions</div>
       <div style="text-align:center;margin-top:8px">
         <button type="button" class="mkbtn" id="aboutbtn" style="width:auto;display:inline-block">About this instrument</button>
         <button type="button" class="mkbtn" id="howsearchbtn" style="width:auto;display:inline-block;margin-left:6px">How to: search &amp; tune</button>
@@ -2666,7 +3861,7 @@ PAGE_HEAD = <<~'HTML'
       </div>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:6px">
         <svg viewBox="0 0 24 24" width="75" height="75" fill="none" stroke="var(--amber)"><circle cx="12" cy="12" r="9.5" stroke-width="0.65"/><ellipse cx="12" cy="12" rx="4" ry="9.5" stroke-width="0.325"/><line x1="2.5" y1="12" x2="21.5" y2="12" stroke-width="0.325"/><line x1="4" y1="6.5" x2="20" y2="6.5" stroke-width="0.325"/><line x1="4" y1="17.5" x2="20" y2="17.5" stroke-width="0.325"/></svg>
-        <div class="sub" style="flex:1;text-align:center;margin-top:0">cross-reference scan · footprints × addresses × parcels · optional LiDAR refine</div>
+        <div class="sub" style="flex:1;text-align:center;margin-top:0">unregistered structures · abandoned ruins · shape search · closed institutions &amp; dead malls</div>
         <svg viewBox="0 0 24 24" width="75" height="75" fill="none" stroke="var(--amber)" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"><path d="M21.5 3.2 q1 -0.2 0.9 0.9 l-0.9 4.2 l-5.5 5 l1.2 5.8 q0.1 0.6 -0.5 0.9 l-0.9 0.4 l-3 -5.1 l-3.3 3 l0.2 2.4 q0 0.5 -0.5 0.6 l-0.6 0.1 l-1.4 -3.1 l-3.1 -1.4 l0.1 -0.6 q0.1 -0.5 0.6 -0.5 l2.4 0.2 l3 -3.3 l-5.1 -3 l0.4 -0.9 q0.3 -0.6 0.9 -0.5 l5.8 1.2 l5 -5.5 z"/></svg>
       </div>
     </header>
@@ -2675,16 +3870,28 @@ PAGE_HEAD = <<~'HTML'
       <fieldset><legend>About — purpose</legend>
         <div class="abt">
           <p><strong>Structure Hunter finds structures that exist on the ground but are
-          missing, hidden, or unacknowledged in official records.</strong> Its core idea is a
+          missing, hidden, or unacknowledged in official records — and the physical remains of
+          structures the records still claim are there but aren't.</strong> Its core idea is a
           mismatch: compare <em>what is physically there</em> (building footprints, and the
           raw shape of the land from laser scanning) against <em>what is officially registered</em>
-          (address points and tax parcels). Where a structure exists but no record claims it,
-          that gap is a candidate — an unregistered cabin, a forgotten outbuilding, an
-          abandoned homestead, a structure hidden under tree canopy, or the ghost of a
-          foundation long since overgrown.</p>
+          (address points and tax parcels). Where the two disagree, that gap is a candidate.</p>
+          <p>It works in <strong>two complementary ways</strong>, and most tools do only the first:</p>
+          <p><strong>· Address &amp; parcel cross-reference finds the <em>unregistered</em></strong> —
+          structures the addressing system never recorded: an unpermitted cabin, an off-grid dwelling,
+          a forgotten outbuilding, a structure deep in the woods with no road to it.</p>
+          <p><strong>· LiDAR physical detection finds the <em>abandoned and the hidden</em></strong> —
+          structures under tree canopy that footprint maps missed, and — in <em>ruins mode</em> — the
+          low remains of abandoned buildings: foundation slabs, low walls, leveled pads. This is the
+          opposite mismatch: the records say &ldquo;house,&rdquo; the ground shows only a foundation.
+          Abandoned homes keep their address points for decades, so an ordinary address scan is blind
+          to them — but their physical remains show up here.</p>
+          <p>Beyond finding structures, it can <strong>classify what each one likely is</strong> (from
+          shape, size, and roof form), <strong>search for buildings by shape</strong>, and run a
+          focused hunt for <strong>closed institutions and dead retail</strong> — defunct schools,
+          jails, hospitals, civic buildings, and dead malls.</p>
           <p>Everything it uses is public, authoritative data: OpenStreetMap and state building
           footprints, the National Address Database and state address points, county parcel
-          layers, and USGS 3DEP LiDAR and elevation models.</p>
+          layers, the OSM road network, and USGS 3DEP LiDAR and elevation models.</p>
         </div>
       </fieldset>
 
@@ -2734,7 +3941,51 @@ PAGE_HEAD = <<~'HTML'
           and region, the program measures, for the buildings it judged registered, how far each
           sits from its address — and reports the distribution. That tells you the natural cutoff
           for the area you are actually scanning, so the registration threshold is set from
-          evidence rather than guesswork.</p>
+          evidence rather than guesswork. On large areas it measures a representative sample, which
+          is statistically equivalent and far faster.</p>
+
+          <p><strong>7 · Ruins mode — finding foundations, not buildings.</strong> Abandoned homes and
+          ruins keep their address points (addresses belong to the parcel, and emergency systems never
+          retire them), so the address scan can't see them. Ruins mode ignores addresses entirely and
+          retunes the LiDAR detector for <em>low</em> features (roughly 0.25–1.8&nbsp;m — a slab, low
+          walls, a leveled pad) instead of wall-height buildings. When height can't help, <em>shape</em>
+          does the discriminating: a low <em>rectangular</em> feature is almost certainly man-made (a
+          foundation), while a low <em>irregular</em> blob is natural ground, so the mode keeps the
+          geometric ones and drops the rest. Each hit is classed by height as a slab, low walls, or a
+          partial/collapsing structure.</p>
+
+          <p><strong>8 · Shape classification and search.</strong> Every candidate's footprint gets a
+          true oriented bounding rectangle (via <em>rotating calipers</em> — spinning the shape against
+          its convex hull to find the tightest box), a shape family, and a likely type from shape plus
+          real size. With LiDAR, roof form (flat / pitched / steep, read from height roughness) sharpens
+          the guess. You can also <em>search by shape</em>: filter to a family (long &amp; thin, L-shaped,
+          circular…) or paste/sketch a specific outline and rank every candidate by how closely it
+          matches. Matching uses <em>Hu invariant moments</em> — seven numbers computed from the filled
+          polygon that stay the same whether the shape is rotated, resized, or mirrored — so the same
+          shape matches at any angle or scale.</p>
+
+          <p><strong>9 · Road distance &amp; estimated address.</strong> When you drop a pin on a map it
+          always returns an address, because it <em>reverse-geocodes</em> — interpolating the nearest
+          road, not confirming a registered address exists. The tool shows both sides of that: it fetches
+          the road network and reports each candidate's distance to the nearest road (flagging the
+          genuinely roadless, deep-woods finds), plus a nearest-road estimate clearly labeled as an
+          estimate. A structure with no registered address <em>and</em> no road reaching it is the
+          strongest unregistered-structure signature.</p>
+
+          <p><strong>10 · Context filtering.</strong> Some buildings match the &ldquo;no nearby
+          address&rdquo; signature innocently — churches, schools, and rec centers are large buildings
+          set far back on big lots. Using parcel use codes, ownership, and OSM land-use zones, the tool
+          recognizes industrial and institutional sites and can flag-and-sink or reject them, so your
+          genuine leads rise to the top.</p>
+
+          <p><strong>11 · Closed institutions &amp; dead retail.</strong> A focused mode finds defunct
+          schools, jails, hospitals, and civic buildings — plus dead malls and department stores —
+          two ways. <em>OSM lifecycle tags</em>: mappers mark closed sites <em>disused</em>,
+          <em>abandoned</em>, or <em>demolished</em> (works in any state). And a <em>parcel
+          value heuristic</em>: a parcel classified institutional or large-retail whose building value
+          has collapsed to near zero is the records&rsquo; own signature of a vacated, condemned, or
+          demolished building — the land keeps its value, the structure does not. Candidates are tagged
+          civic vs retail, and the mode points you to authoritative registries to confirm.</p>
         </div>
       </fieldset>
 
@@ -2849,20 +4100,63 @@ PAGE_HEAD = <<~'HTML'
           <em>Isolation search cap</em> only sets how far out the tool bothers to measure the nearest
           address; it changes the reported distance, not which structures qualify.</p>
 
-          <p><strong>Step 6 · Filter by shape.</strong> Round storage tanks are building-sized and
-          otherwise pass every filter. Leave the default on to tag lone circular shapes "tank-like" and
-          sink them to the bottom of the list, or tick <em>Hide round tank-like shapes</em> to remove
-          them entirely. A circle with anything attached still passes — only bare circles are flagged.</p>
+          <p><strong>Step 6 · Filter or search by shape.</strong> Round storage tanks are building-sized
+          and otherwise pass every filter — leave the default on to tag lone circular shapes
+          &ldquo;tank-like&rdquo; and sink them, or tick <em>Hide round tank-like shapes</em> to remove
+          them. Beyond that, the <em>Shape search</em> section lets you hunt by shape: pick a family
+          (long &amp; thin, L-shaped, square, circular…) to keep only matching candidates, or give a
+          <em>specific outline</em> — tap a preset (rectangle, L, T, octagon…), sketch corners on the pad,
+          or paste coordinates — and every candidate is ranked by how closely it matches, rotation- and
+          scale-independent. Set a minimum match % to trim the list.</p>
 
-          <p><strong>Step 7 · Read the results.</strong> Candidates appear ranked, highest-priority
-          first, with a Shape value and a Google Maps link per row. With LiDAR on, numbered markers sit
-          on the imagery and link to the table both ways: tap a marker to highlight its row, tap a row
-          to flash its marker. The full list is also written to candidates.csv / candidates.geojson.</p>
+          <p><strong>Step 7 · Hunt abandoned structures (ruins mode).</strong> To find abandoned homes and
+          ruins the address scan can't see, turn on LiDAR and tick <em>ruins mode</em>. It looks for
+          <em>low</em> rectangular features — foundation slabs, low walls, leveled pads — instead of
+          standing buildings, and ignores addresses entirely. Point it at a place you suspect holds ruins
+          and the foundations surface; in a populated area it will also pick up decks and low structure
+          parts, so pair it with the bare-earth imagery to eyeball each hit and dismiss the false ones.</p>
+
+          <p><strong>Step 8 · See how remote each find is.</strong> Tick <em>Measure distance to nearest
+          road + estimate address</em> to fetch the road network and show, per candidate, how far it sits
+          from the nearest road (roadless deep-woods finds are flagged) and an estimated street (the
+          nearest road name — an estimate, not a registered address). A candidate with no parcel, far from
+          any road, is a classic unregistered structure.</p>
+
+          <p><strong>Step 9 · Suppress the innocent look-alikes.</strong> Churches, schools, and rec
+          centers naturally look isolated (big buildings far back on big lots). Tick <em>Check
+          OpenStreetMap industrial, railway &amp; institutional zones</em> to flag and sink them, and
+          optionally <em>Reject churches, schools, clubs &amp; civic buildings entirely</em> to drop them.
+          With NC OneMap parcels, each candidate also shows its tax use, so you can see why something was
+          flagged.</p>
+
+          <p><strong>Step 10 · Find closed institutions &amp; dead malls.</strong> A separate focused mode
+          (not the normal scan): tick <em>Find defunct schools, jails, hospitals, civic buildings &amp;
+          dead malls</em>. It combines OSM &ldquo;disused / abandoned / demolished&rdquo; tags (any state)
+          with a parcel heuristic (institutional or large-retail parcels whose building value has collapsed
+          to near zero). Add a parcel source for the value signal; works best in urban cores where more
+          closures are mapped. Results are tagged civic vs retail and point you to archives and county
+          records to confirm.</p>
+
+          <p><strong>Step 11 · Read the results.</strong> Candidates appear ranked, highest-priority
+          first, each with its shape, likely type, and a Google Maps link. With LiDAR on, numbered markers
+          sit on the imagery and link to the table both ways: tap a marker to highlight its row, tap a row
+          to flash its marker. <strong>Save</strong> any promising find (the ★ button on each row) to
+          your investigation archive, and mark ones you've checked with <em>dismiss</em> so they're
+          skipped on future scans. The full list is also written to candidates.csv / candidates.geojson.</p>
+
+          <p><strong>Your saved-places archive.</strong> The ★ save button on any candidate — in any
+          result mode — adds it to a running <em>Saved places</em> panel with whatever the tool knew
+          about it (likely type, shape, notes) plus an optional note you type. The archive persists
+          across scans and survives clearing the cache, so it's a genuine running list of everywhere you
+          want to investigate. From the panel you can open each in Google Maps, edit its note, remove it,
+          or <strong>export the whole list to GeoJSON or CSV</strong> to carry into the field (Google
+          Earth, QGIS, a GPS app).</p>
 
           <p><strong>A good first pass:</strong> scan a county you know with defaults; read the
           calibration readout; set Address distance to its suggestion; add Min clearance ~80&nbsp;m and
           Max neighbors 0 if you want truly solitary structures; re-run. Then draw small boxes on the
-          most promising spots for the full LiDAR treatment.</p>
+          most promising spots for the full LiDAR treatment — and try ruins mode where you suspect
+          abandoned buildings.</p>
         </div>
       </fieldset>
     </section>
@@ -2914,6 +4208,14 @@ PAGE_HEAD = <<~'HTML'
           rectangular, sharply linear, or suspiciously level. Those are the signatures of human work the
           ground still remembers. Double-tap the best ones to confirm against satellite imagery.</p>
 
+          <p><strong>Reading ruins-mode finds.</strong> When you run <em>ruins mode</em>, the candidates
+          are low features — foundations and pads. The bare-earth view is exactly where these live: a
+          foundation slab reads as a faint rectangular outline or a level pad, low walls as a shallow
+          rectangular rim. Use sky-view + exaggeration to lift them, and trust the <em>rectangular</em>
+          ones — a crisp right-angled outline in the bare earth is almost always the footprint of a
+          building that's no longer standing. Double-tap to check the spot against satellite imagery
+          (often you'll see a clearing, a driveway trace, or scattered debris where the building was).</p>
+
           <p><strong>Why a spot may look poor:</strong> resolution depends on the LiDAR project — point
           density and flight season especially. Leaf-off winter scans see under bare deciduous canopy;
           summer scans largely do not; evergreens block the laser year-round. If a wooded area looks
@@ -2957,6 +4259,46 @@ def dismissed_panel_html
         They're matched within ~20&nbsp;m, so they stay skipped even if coordinates shift slightly.
         Restore any to let it appear in results again. (These survive clearing the cache.)</div>
         <table><tr><th>Location</th><th>Note</th><th>Dismissed</th><th></th></tr>#{rows}</table>
+      </details>
+    </fieldset>
+  HTML
+end
+
+def saved_panel_html
+  list = load_saved
+  return '' if list.empty?
+  rows = list.sort_by { |s| s[:at].to_s }.reverse.map do |s|
+    link = "https://maps.google.com/?q=#{s[:lat]},#{s[:lng]}"
+    what = [s[:label].to_s, s[:shape].to_s].reject(&:empty?).join(' · ')
+    what = '<span class="muted">saved place</span>' if what.empty?
+    meta = []
+    meta << "<span class='sv-mode'>#{esc(s[:mode])}</span>" unless s[:mode].to_s.empty?
+    meta << esc(s[:info]) unless s[:info].to_s.empty?
+    note_html = s[:note].to_s.empty? ? "<span class='muted'>— no note —</span>" : esc(s[:note])
+    "<tr data-lat=\"#{s[:lat]}\" data-lng=\"#{s[:lng]}\">" \
+      "<td><b>#{what}</b>#{meta.empty? ? '' : "<div class='saved-meta'>#{meta.join(' · ')}</div>"}</td>" \
+      "<td class=\"saved-note\" data-note=\"#{esc(s[:note].to_s)}\">#{note_html}</td>" \
+      "<td class=\"saved-meta\">#{s[:at]}</td>" \
+      "<td class=\"loc-cell\"><a href=\"#{link}\" target=\"_blank\">#{s[:lat]}, #{s[:lng]}</a></td>" \
+      "<td class=\"actcell\">" \
+        "<button type=\"button\" class=\"dismiss-btn\" onclick=\"editSavedNote(this)\">edit note</button> " \
+        "<button type=\"button\" class=\"dismiss-btn\" onclick=\"unsavePanel(this)\">remove</button>" \
+      "</td></tr>"
+  end.join
+  <<~HTML
+    <fieldset style="margin-top:26px"><legend>★ Saved places to investigate (#{list.size})</legend>
+      <details class="collapse" open>
+        <summary>Show / manage #{list.size} saved place#{list.size == 1 ? '' : 's'}</summary>
+        <div class="note" style="margin:10px 0">Your archive of finds worth a closer look. Each keeps
+        what the tool knew about it plus any note you added, and persists across scans and cache clears.
+        Open any in Google Maps, edit its note, or remove it when you're done. Export the whole list to
+        take it into the field (Google Earth, QGIS, a GPS app):</div>
+        <div style="margin-bottom:12px">
+          <a class="saved-export" href="/saved/export.geojson">⬇ Export GeoJSON</a>
+          <a class="saved-export" href="/saved/export.csv">⬇ Export CSV</a>
+          <button type="button" class="dismiss-btn" onclick="clearSaved(this)" style="margin-left:6px">Clear archive</button>
+        </div>
+        <table><tr><th>What</th><th>Note</th><th>Saved</th><th>Location</th><th></th></tr>#{rows}</table>
       </details>
     </fieldset>
   HTML
@@ -3078,23 +4420,103 @@ def form_html(p)
       </div>
     </fieldset>
 
+    <fieldset><legend>Shape search (optional)</legend>
+      <div class="row">
+        <label class="f" style="min-width:180px">
+          <span class="lbl">Shape spec</span>
+          <select name="shape_spec">
+            <option value="any" #{(p['shape_spec'] || 'any') == 'any' ? 'selected' : ''}>Any shape</option>
+            <option value="rectangle" #{p['shape_spec'] == 'rectangle' ? 'selected' : ''}>Rectangular (incl. square)</option>
+            <option value="square" #{p['shape_spec'] == 'square' ? 'selected' : ''}>Square only</option>
+            <option value="long" #{p['shape_spec'] == 'long' ? 'selected' : ''}>Long &amp; thin (barn / trailer-like)</option>
+            <option value="lshape" #{p['shape_spec'] == 'lshape' ? 'selected' : ''}>L / T-shaped (dwelling w/ wing)</option>
+            <option value="circular" #{p['shape_spec'] == 'circular' ? 'selected' : ''}>Circular (tank / silo)</option>
+            <option value="irregular" #{p['shape_spec'] == 'irregular' ? 'selected' : ''}>Irregular / complex</option>
+          </select>
+          <span class="hint">keep only candidates of this shape family</span>
+        </label>
+        #{field('Aspect ratio min', 'shape_aspect_min', p['shape_aspect_min'],
+                'length÷width ≥ this (e.g. 3 = long &amp; thin)')}
+        #{field('Aspect ratio max', 'shape_aspect_max', p['shape_aspect_max'],
+                'length÷width ≤ this (e.g. 1.3 = squarish)')}
+      </div>
+      <label class="f" style="width:100%">
+        <span class="lbl">Match a specific outline</span>
+        <div class="shape-tools">
+          <div class="shape-presets">
+            <span class="presets-label">Presets:</span>
+            <button type="button" class="preset-btn" data-shape="0,0 30,0 30,18 0,18">▭ Rectangle</button>
+            <button type="button" class="preset-btn" data-shape="0,0 18,0 18,18 0,18">◻ Square</button>
+            <button type="button" class="preset-btn" data-shape="0,0 48,0 48,7 0,7">▬ Long &amp; thin</button>
+            <button type="button" class="preset-btn" data-shape="0,0 20,0 20,8 8,8 8,18 0,18">⌐ L-shape</button>
+            <button type="button" class="preset-btn" data-shape="0,0 22,0 22,7 14,7 14,20 8,20 8,7 0,7">⊤ T-shape</button>
+            <button type="button" class="preset-btn" data-shape="0,0 24,0 24,7 17,7 17,24 0,24 0,17 7,17 7,7 0,7">L U-shape</button>
+            <button type="button" class="preset-btn" data-shape="7,0 17,0 24,7 24,17 17,24 7,24 0,17 0,7">⬡ Octagon</button>
+            <button type="button" class="preset-btn" data-shape="12,0 24,12 12,24 0,12">◇ Diamond</button>
+            <button type="button" class="preset-btn" data-shape="circle">○ Round</button>
+            <button type="button" class="preset-btn" data-shape="0,0 14,0 28,0 28,10 28,22 14,22 14,10 0,10">⊢ Cross/wing</button>
+          </div>
+          <div class="sketch-wrap">
+            <div class="sketch-head">
+              <span>Or sketch it: click to drop corners, in order around the outline</span>
+              <span class="sketch-actions">
+                <label class="sketch-size">size
+                  <select id="sketchSize">
+                    <option value="280" selected>S</option>
+                    <option value="380">M</option>
+                    <option value="500">L</option>
+                    <option value="640">XL</option>
+                  </select>
+                </label>
+                <button type="button" class="sketch-btn" id="sketchUndo">undo point</button>
+                <button type="button" class="sketch-btn" id="sketchClear">clear</button>
+              </span>
+            </div>
+            <svg id="sketchPad" viewBox="0 0 400 400" preserveAspectRatio="xMidYMid meet"></svg>
+            <span class="hint">The grid is just for proportion — position, size &amp; rotation don't matter, only the shape. At least 3 points.</span>
+          </div>
+        </div>
+        <textarea name="shape_target" id="shapeTarget" rows="3" placeholder="Pick a preset, sketch above, or paste corner points here, e.g.&#10;0,0  20,0  20,8  8,8  8,16  0,16&#10;(plain x,y or lng,lat pairs · position, size &amp; rotation don't matter — only the shape)">#{esc(p['shape_target'].to_s)}</textarea>
+        <span class="hint">ranks every candidate by how closely its footprint matches this outline (rotation-, scale- &amp; mirror-independent). Combine with a minimum match % below.</span>
+      </label>
+      #{field('Minimum shape match %', 'shape_min_match', p['shape_min_match'],
+              'only show candidates matching the pasted outline at least this well (0–100)')}
+    </fieldset>
+
     <fieldset><legend>Context &amp; accuracy (optional)</legend>
       <label class="chk">
         <input type="checkbox" name="use_zones" #{p['use_zones'] == 'on' ? 'checked' : ''}>
-        <span><strong>Check OpenStreetMap industrial &amp; railway zones.</strong> Fetches
-        industrial / commercial / quarry land-use, rail yards, airports, and rail lines for
-        the area, and notes when a candidate sits inside one. Adds an OSM fetch (cached after
-        the first run). Great for ruling out warehouses and train yards.</span>
+        <span><strong>Check OpenStreetMap industrial, railway &amp; institutional zones.</strong>
+        Fetches industrial / commercial / quarry land-use, rail yards, airports, rail lines, and
+        institutional places (churches, schools, sports &amp; community centers, hospitals,
+        cemeteries) for the area, and notes when a candidate sits inside or beside one. Adds an
+        OSM fetch (cached after the first run). Great for ruling out warehouses, train yards,
+        churches, and rec centers.</span>
       </label>
-      <label class="chk" style="margin-bottom:0">
+      <label class="chk">
         <input type="checkbox" name="reject_zones" #{p['reject_zones'] == 'on' ? 'checked' : ''}>
         <span><strong>Reject candidates inside those zones entirely</strong> (default: keep them,
         flagged and pushed down the ranking). Only takes effect with the box above ticked.</span>
       </label>
+      <label class="chk">
+        <input type="checkbox" name="use_roads" #{p['use_roads'] == 'on' ? 'checked' : ''}>
+        <span><strong>Measure distance to nearest road + estimate address.</strong> Fetches the
+        OSM road network and, for each candidate, shows how far it sits from the nearest road and
+        an <em>estimated</em> street (reverse-geocode style — the nearest road name, not a registered
+        address). Structures <strong>300&nbsp;m+ from any road are flagged</strong> — the deep-woods,
+        no-road-access finds that are hardest to reach and least likely to be documented.</span>
+      </label>
+      <label class="chk" style="margin-bottom:0">
+        <input type="checkbox" name="reject_institutional" #{p['reject_institutional'] == 'on' ? 'checked' : ''}>
+        <span><strong>Reject churches, schools, clubs &amp; civic buildings entirely.</strong>
+        Uses parcel use codes (e.g. CHURCH, SCHOOL, RECREATION) and organization ownership to drop
+        institutional/civic/religious sites — the well-known big buildings on large lots that flood
+        results. Default: keep them, flagged and sunk to the bottom.</span>
+      </label>
       <div class="note" style="margin-top:10px">With NC OneMap parcels, each candidate also shows
-      its <strong>tax use</strong> (e.g. SFR, COMMERCIAL), <strong>site address</strong>, and a
-      <strong>notes</strong> column summarizing accuracy signals — industrial use, building clusters,
-      large parcels, and non-individual owners are flagged automatically.</div>
+      its <strong>tax use</strong> (e.g. SFR, COMMERCIAL, CHURCH), <strong>site address</strong>, and a
+      <strong>notes</strong> column summarizing accuracy signals — industrial &amp; institutional use,
+      organization ownership, building clusters, and large parcels are flagged automatically.</div>
       <label class="chk" style="margin:12px 0 0">
         <input type="checkbox" name="hide_dismissed" #{p['hide_dismissed'] == 'on' ? 'checked' : ''}>
         <span><strong>Hide dismissed locations entirely.</strong> When you mark a result "dismiss"
@@ -3109,6 +4531,15 @@ def form_html(p)
         Fully automatic: download &amp; process USGS point clouds for this area,
         then hunt (small areas only, ~1.5 km · one-time setup:
         pip install laspy lazrs numpy pyproj)
+      </label>
+      <label class="chk">
+        <input type="checkbox" name="ruins_mode" #{p['ruins_mode'] == 'on' ? 'checked' : ''}>
+        <span><strong>Hunt abandoned structures &amp; foundations (ruins mode).</strong>
+        Looks for LOW rectangular features — foundation slabs, low walls, leveled pads
+        (~0.25–1.8 m) — instead of standing buildings, and <strong>ignores addresses entirely</strong>.
+        This finds the "records say house, ground says foundation" case: abandoned homes and
+        ruins keep their address points, so the normal scan misses them — but their physical
+        remains show up here. Use with one of the LiDAR options above.</span>
       </label>
       <label class="chk">
         <input type="checkbox" name="lidar_quick" #{p['lidar_quick'] == 'on' ? 'checked' : ''}>
@@ -3171,6 +4602,22 @@ def form_html(p)
       </label>
     </fieldset>
 
+    <fieldset><legend>Closed institutions &amp; dead retail (optional)</legend>
+      <label class="chk" style="margin-bottom:0">
+        <input type="checkbox" name="closed_inst" #{p['closed_inst'] == 'on' ? 'checked' : ''}>
+        <span><strong>Find defunct schools, jails, hospitals, civic buildings &amp; dead malls.</strong> A
+        focused search (instead of the normal scan) for institutions <em>and</em> large retail — malls,
+        department stores, supermarkets, big-box — that are closed, disused, or abandoned. Combines two
+        signals: <strong>OpenStreetMap lifecycle tags</strong> — sites mappers have marked <em>disused</em>,
+        <em>abandoned</em>, or <em>demolished</em> (works in any state) — and, where a parcel source is set,
+        a <strong>parcel heuristic</strong>: institutional or large-retail parcels whose building value has
+        collapsed to near zero (the signature of a vacated, condemned, or demolished site). Each result is
+        tagged 🏛 civic or 🛍 retail. Works best in urban areas (more closures are mapped) and with NC OneMap
+        or a county parcel URL added. Only <em>large-format</em> retail is included — small shops turn over
+        too often to be a useful signal.</span>
+      </label>
+    </fieldset>
+
     <button type="submit">Run scan</button>
     </form>
   HTML
@@ -3190,6 +4637,67 @@ def calib_histogram(bands)
     "</div>"
   end.join
   "<div class=\"hbars\">#{rows}</div>"
+end
+
+def closed_inst_panel_html(list, source)
+  saved = load_saved
+  rows = list.each_with_index.map do |c, i|
+    g = "https://www.google.com/maps/search/?api=1&query=#{c[:lat]},#{c[:lng]}"
+    srcs = (c[:sources] || [c[:source]]).join('+')
+    badge = srcs.include?('+') ? 'both' : srcs
+    statetxt = esc(c[:state].to_s.tr('_', ' '))
+    confidence = c[:score] >= 1.0 ? 'strong' : (c[:score] >= 0.85 ? 'good' : 'possible')
+    cat = (c[:category] || 'institution').to_s
+    cat_label = cat == 'retail' ? '🛍 retail' : '🏛 civic'
+    sv = saved_match(saved, c[:lat], c[:lng])
+    s_label = [c[:kind].to_s, c[:name].to_s].reject(&:empty?).join(' — ')
+    s_info = "#{c[:state]} · #{c[:why]}"
+    <<~ROW
+      <tr data-lat="#{c[:lat]}" data-lng="#{c[:lng]}" data-label="#{esc(s_label)}" data-shape="" data-info="#{esc(s_info)}" data-mode="closed-institution">
+        <td class="rk">#{i + 1}</td>
+        <td><span class="ci-cat ci-cat-#{cat}">#{cat_label}</span></td>
+        <td><span class="ci-badge ci-#{badge}">#{esc(badge)}</span></td>
+        <td><b>#{esc(c[:kind].to_s)}</b>#{c[:name] ? "<span class='ci-name'>#{esc(c[:name])}</span>" : ''}</td>
+        <td><span class="ci-state">#{statetxt}</span></td>
+        <td class="notes-cell">#{esc(c[:why].to_s)}</td>
+        <td class="ci-conf ci-#{confidence}">#{confidence}</td>
+        <td><a href="#{g}" target="_blank">#{c[:lat]}, #{c[:lng]}</a></td>
+        <td class="actcell">#{save_btn_html(sv)}</td>
+      </tr>
+    ROW
+  end.join
+
+  n_retail = list.count { |c| (c[:category] || 'institution').to_s == 'retail' }
+  n_inst = list.size - n_retail
+  body =
+    if list.empty?
+      "<div class=\"note\" style=\"margin-top:12px\">No closed or inactive institutions or dead retail " \
+      "found here. OSM coverage of disused/abandoned tags varies by area, and the parcel heuristic needs " \
+      "a parcel source (NC OneMap, or a county ArcGIS URL) with building-value data. Try a larger area, an " \
+      "urban core (more closures are mapped), or add a parcel source.</div>"
+    else
+      "<table><tr><th>#</th><th>Type</th><th>Source</th><th>What</th><th>Status</th>" \
+      "<th>Why flagged</th><th>Confidence</th><th>Location</th><th></th></tr>#{rows}</table>"
+    end
+
+  <<~HTML
+    <fieldset style="margin-top:20px"><legend>Closed / inactive institutions &amp; dead retail</legend>
+      <div class="stat">#{source ? "data: #{esc(source)} · " : ''}<strong>#{list.size}</strong>
+      candidate#{list.size == 1 ? '' : 's'}#{list.empty? ? '' : " — #{n_inst} civic/institutional, #{n_retail} large retail"}
+      (OSM lifecycle tags + parcel value heuristic)</div>
+      #{body}
+      <div class="note" style="margin-top:14px"><strong>These are candidates — confirm them.</strong>
+      The <strong>Type</strong> column marks each as 🏛 civic/institutional (school, jail, hospital, church,
+      civic) or 🛍 retail (mall, department store, supermarket). "Source: OSM" means a mapper tagged the
+      site disused/abandoned/demolished. "Source: parcel" means a parcel whose building value has collapsed
+      to near zero. "both" is the strongest signal. Note: dead malls and big-box stores show up well in OSM;
+      the parcel signal catches them most reliably once <em>demolished</em> (a standing empty store often
+      keeps its assessed value for a while). To verify a find, check authoritative records: state archives
+      (e.g. the NC State Archives keep records of defunct colleges), the National Register of Historic Places,
+      "dead mall" trackers, and your county's property / real-estate search portal (look up the parcel's
+      ownership history and current status).</div>
+    </fieldset>
+  HTML
 end
 
 def calibrate_panel_html(c)
@@ -3237,12 +4745,25 @@ def calib_html(c)
   HTML
 end
 
+def save_btn_html(saved_record)
+  if saved_record
+    "<button type='button' class='save-btn saved' onclick='unsaveCand(this)' title='Saved — click to remove'>\u2605 saved</button>"
+  else
+    "<button type='button' class='save-btn' onclick='saveCand(this)' title='Save to investigate later'>\u2606 save</button>"
+  end
+end
+
 def results_html(result, lidar_result, source, lidar_help, lidar_imgs = [], geo_box = nil)
   # Pre-calibration mode: show only the calibration panel, no candidate tables.
   if result.is_a?(Hash) && result[:calibrate_only]
     return "<div class=\"stat\" style=\"margin-top:20px\">#{source ? "data: #{esc(source)}" : ''}</div>" +
            calibrate_panel_html(result[:calib])
   end
+  # Closed / inactive institutions mode: show the dedicated results table.
+  if result.is_a?(Hash) && result[:closed_inst]
+    return closed_inst_panel_html(result[:closed], source)
+  end
+  saved = load_saved   # to mark already-archived candidates with a filled star
   markers = ''
   if geo_box
     bw = geo_box[2] - geo_box[0]
@@ -3273,15 +4794,19 @@ def results_html(result, lidar_result, source, lidar_help, lidar_imgs = [], geo_
   if result
     result[:candidates].first(100).each_with_index do |c, idx|
       link = "https://maps.google.com/?q=#{c[:lat]},#{c[:lng]}"
+      sv = saved_match(saved, c[:lat], c[:lng])
+      s_label = c[:tank] ? 'tank / silo' : c[:likely_type].to_s
+      s_shape = "#{c[:shape_class]}#{c[:dim].to_s.empty? ? '' : " #{c[:dim]}"}"
+      s_info = c[:notes].to_s
       vec_rows << <<~R
-        <tr id="row-v#{idx + 1}" data-mk="v#{idx + 1}" data-lat="#{c[:lat]}" data-lng="#{c[:lng]}" class="candrow#{c[:tank] ? ' tankrow' : ''}#{c[:flagged] ? ' flagrow' : ''}#{c[:dismissed] ? ' disrow' : ''}"><td class="rk">#{idx + 1}</td><td class="sc">#{c[:score]}</td><td>#{c[:area_m2]}</td>
+        <tr id="row-v#{idx + 1}" data-mk="v#{idx + 1}" data-lat="#{c[:lat]}" data-lng="#{c[:lng]}" data-label="#{esc(s_label)}" data-shape="#{esc(s_shape)}" data-info="#{esc(s_info)}" data-mode="cross-reference" class="candrow#{c[:tank] ? ' tankrow' : ''}#{c[:flagged] ? ' flagrow' : ''}#{c[:dismissed] ? ' disrow' : ''}"><td class="rk">#{idx + 1}</td><td class="sc">#{c[:score]}</td><td>#{c[:area_m2]}</td>
         <td>#{c[:nearest_address_m]}</td><td>#{c[:parcel_improvement]}</td>
         <td>#{c[:neighbors_200m]}</td>
         <td>#{esc(c[:use_desc].to_s)}</td>
-        <td class="shapecell">#{c[:glyph]}<span class="shapetxt"><b>#{c[:tank] ? 'tank / silo' : esc(c[:shape_class].to_s)}</b>#{c[:dim].to_s.empty? ? '' : "<span class='dim'>#{c[:dim]}</span>"}<span class='ltype'>#{c[:tank] ? '' : esc(c[:likely_type].to_s)}</span></span></td>
+        <td class="shapecell">#{c[:glyph]}<span class="shapetxt"><b>#{c[:tank] ? 'tank / silo' : esc(c[:shape_class].to_s)}</b>#{c[:dim].to_s.empty? ? '' : "<span class='dim'>#{c[:dim]}</span>"}<span class='ltype'>#{c[:tank] ? '' : esc(c[:likely_type].to_s)}</span>#{c[:shape_match] ? "<span class='smatch'>#{c[:shape_match]}% shape match</span>" : ''}</span></td>
         <td class="notes-cell">#{c[:dismissed] ? "<span class='distag'>dismissed#{c[:dismiss_reason].to_s.empty? ? '' : ": #{esc(c[:dismiss_reason])}"}</span>" : esc(c[:notes].to_s)}</td>
-        <td><a href="#{link}" target="_blank">#{c[:lat]}, #{c[:lng]}</a></td>
-        <td class="actcell">#{c[:dismissed] ? "<button type='button' class='dismiss-btn restore' onclick='undismiss(this)'>restore</button>" : "<button type='button' class='dismiss-btn' onclick='dismissCand(this)'>dismiss</button>"}</td></tr>
+        <td class="loc-cell"><a href="#{link}" target="_blank">#{c[:lat]}, #{c[:lng]}</a>#{c[:road_dist] ? "<span class='roadinfo#{c[:road_dist] >= 300 ? ' roadfar' : ''}'>#{c[:road_dist]}m to road</span>" : ''}#{c[:est_addr].to_s.empty? ? '' : "<span class='estaddr'>est: #{esc(c[:est_addr])}</span>"}</td>
+        <td class="actcell">#{save_btn_html(sv)}#{c[:dismissed] ? "<button type='button' class='dismiss-btn restore' onclick='undismiss(this)'>restore</button>" : "<button type='button' class='dismiss-btn' onclick='dismissCand(this)'>dismiss</button>"}</td></tr>
       R
     end
   end
@@ -3289,12 +4814,17 @@ def results_html(result, lidar_result, source, lidar_help, lidar_imgs = [], geo_
   if lidar_result
     lidar_result.first(100).each_with_index do |c, idx|
       link = "https://maps.google.com/?q=#{c[:lat]},#{c[:lng]}"
+      sv = saved_match(saved, c[:lat], c[:lng])
+      s_label = c[:tank] ? 'tank / silo' : c[:likely_type].to_s
+      s_shape = "#{c[:shape_class]}#{c[:dim].to_s.empty? ? '' : " #{c[:dim]}"}"
+      s_info = "height #{c[:mean_height_m]}m, roughness #{c[:roughness_m]}#{c[:roof].to_s.empty? ? '' : ", #{c[:roof]}"}"
+      s_mode = c[:ruin] ? 'ruins' : 'LiDAR'
       lid_rows << <<~R
-        <tr id="row-l#{idx + 1}" data-mk="l#{idx + 1}" data-lat="#{c[:lat]}" data-lng="#{c[:lng]}" class="candrow#{c[:tank] ? ' tankrow' : ''}#{c[:dismissed] ? ' disrow' : ''}"><td class="rk">L#{idx + 1}</td><td class="sc">#{c[:roughness_m]}</td><td>#{c[:area_m2]}</td>
+        <tr id="row-l#{idx + 1}" data-mk="l#{idx + 1}" data-lat="#{c[:lat]}" data-lng="#{c[:lng]}" data-label="#{esc(s_label)}" data-shape="#{esc(s_shape)}" data-info="#{esc(s_info)}" data-mode="#{s_mode}" class="candrow#{c[:tank] ? ' tankrow' : ''}#{c[:dismissed] ? ' disrow' : ''}"><td class="rk">L#{idx + 1}</td><td class="sc">#{c[:roughness_m]}</td><td>#{c[:area_m2]}</td>
         <td>#{c[:mean_height_m]}</td>
-        <td class="shapecell">#{c[:dismissed] ? "<span class='distag'>dismissed#{c[:dismiss_reason].to_s.empty? ? '' : ": #{esc(c[:dismiss_reason])}"}</span>" : "#{c[:glyph]}<span class='shapetxt'><b>#{c[:tank] ? 'tank / silo' : esc(c[:shape_class].to_s)}</b>#{c[:dim].to_s.empty? ? '' : "<span class='dim'>#{c[:dim]}</span>"}<span class='ltype'>#{c[:tank] ? '' : esc(c[:likely_type].to_s)}</span>#{c[:roof].to_s.empty? ? '' : "<span class='roof'>#{esc(c[:roof])}</span>"}</span>"}</td>
-        <td><a href="#{link}" target="_blank">#{c[:lat]}, #{c[:lng]}</a></td>
-        <td class="actcell">#{c[:dismissed] ? "<button type='button' class='dismiss-btn restore' onclick='undismiss(this)'>restore</button>" : "<button type='button' class='dismiss-btn' onclick='dismissCand(this)'>dismiss</button>"}</td></tr>
+        <td class="shapecell">#{c[:dismissed] ? "<span class='distag'>dismissed#{c[:dismiss_reason].to_s.empty? ? '' : ": #{esc(c[:dismiss_reason])}"}</span>" : "#{c[:glyph]}<span class='shapetxt'><b>#{c[:tank] ? 'tank / silo' : esc(c[:shape_class].to_s)}</b>#{c[:dim].to_s.empty? ? '' : "<span class='dim'>#{c[:dim]}</span>"}<span class='#{c[:ruin] ? 'ruintype' : 'ltype'}'>#{c[:ruin] ? '⚑ ' : ''}#{c[:tank] ? '' : esc(c[:likely_type].to_s)}</span>#{c[:roof].to_s.empty? ? '' : "<span class='roof'>#{esc(c[:roof])}</span>"}</span>"}</td>
+        <td class="loc-cell"><a href="#{link}" target="_blank">#{c[:lat]}, #{c[:lng]}</a>#{c[:road_dist] ? "<span class='roadinfo#{c[:road_dist] >= 300 ? ' roadfar' : ''}'>#{c[:road_dist]}m to road</span>" : ''}#{c[:est_addr].to_s.empty? ? '' : "<span class='estaddr'>est: #{esc(c[:est_addr])}</span>"}</td>
+        <td class="actcell">#{save_btn_html(sv)}#{c[:dismissed] ? "<button type='button' class='dismiss-btn restore' onclick='undismiss(this)'>restore</button>" : "<button type='button' class='dismiss-btn' onclick='dismissCand(this)'>dismiss</button>"}</td></tr>
       R
     end
   end
@@ -3363,6 +4893,7 @@ def page(p, result = nil, lidar_result = nil, error = nil, source = nil, lidar_h
     (error ? "<div class=\"err\">#{esc(error)}</div>" : '') +
     form_html(p) +
     (result || lidar_help ? results_html(result, lidar_result, source, lidar_help, [], nil) : '') +
+    saved_panel_html +
     examined_panel_html +
     dismissed_panel_html +
     cache_panel_html +
@@ -3374,7 +4905,7 @@ end
 # ============================================================================
 DEFAULTS = {
   'source' => 'files', 'loc_state' => '', 'loc_county' => '',
-  'parcel_url' => '', 'lidar_helper' => '', 'lidar_auto' => '', 'lidar_quick' => '', 'lidar_focus' => 'top1', 'calibrate_only' => '',
+  'parcel_url' => '', 'lidar_helper' => '', 'lidar_auto' => '', 'lidar_quick' => '', 'lidar_focus' => 'top1', 'calibrate_only' => '', 'closed_inst' => '',
   'rend_az' => '315', 'rend_z' => '1', 'rend_mode' => 'hillshade', 'rend_stretch' => '0',
   'hide_tanks' => '', 'hide_dismissed' => '',
   'fp_path' => 'footprints_clip.geojson', 'ad_path' => 'addresses.geojson',
@@ -3382,8 +4913,10 @@ DEFAULTS = {
   'min_lon' => '', 'min_lat' => '', 'max_lon' => '', 'max_lat' => '',
   'threshold' => '50', 'min_area' => '35', 'max_area' => '2000',
   'max_search' => '500', 'max_neighbors' => '', 'neighbor_radius' => '200', 'clear_dist' => '',
-  'max_cluster' => '', 'cluster_radius' => '150', 'use_zones' => '', 'reject_zones' => '',
-  'ndsm_path' => '', 'l_minh' => '2.5', 'l_maxh' => '15',
+  'max_cluster' => '', 'cluster_radius' => '150', 'use_zones' => '', 'use_roads' => '', 'reject_zones' => '', 'reject_institutional' => '',
+  'ndsm_path' => '', 'l_minh' => '2.5', 'l_maxh' => '15', 'ruins_mode' => '',
+  'shape_spec' => 'any', 'shape_aspect_min' => '', 'shape_aspect_max' => '',
+  'shape_target' => '', 'shape_min_match' => '',
   'l_rough' => '1.2', 'l_min_area' => '30', 'l_max_area' => '3000'
 }
 
@@ -3412,6 +4945,12 @@ def build_cfg(p, box)
     l_minh: num(p, 'l_minh'), l_maxh: num(p, 'l_maxh'),
     l_rough: num(p, 'l_rough'),
     l_min_area: num(p, 'l_min_area'), l_max_area: num(p, 'l_max_area'),
+    ruins_mode: p['ruins_mode'] == 'on',
+    shape_spec: (p['shape_spec'].to_s.strip.empty? ? nil : p['shape_spec']),
+    shape_aspect_min: (p['shape_aspect_min'].to_s.strip.empty? ? nil : p['shape_aspect_min'].to_f),
+    shape_aspect_max: (p['shape_aspect_max'].to_s.strip.empty? ? nil : p['shape_aspect_max'].to_f),
+    shape_target: parse_target_shape(p['shape_target']),
+    shape_min_match: (p['shape_min_match'].to_s.strip.empty? ? nil : p['shape_min_match'].to_i),
     hide_tanks: p['hide_tanks'] == 'on',
     hide_dismissed: p['hide_dismissed'] == 'on',
     max_neighbors: (p['max_neighbors'].to_s.strip.empty? ? nil : p['max_neighbors'].to_i),
@@ -3419,11 +4958,29 @@ def build_cfg(p, box)
     max_cluster: (p['max_cluster'].to_s.strip.empty? ? nil : p['max_cluster'].to_i),
     cluster_radius: (p['cluster_radius'].to_s.strip.empty? ? 150.0 : p['cluster_radius'].to_f),
     reject_zones: p['reject_zones'] == 'on',
+    reject_institutional: p['reject_institutional'] == 'on',
     neighbor_radius: (p['neighbor_radius'].to_s.strip.empty? ? 200.0 : p['neighbor_radius'].to_f)
   }
 end
 
 def run_pipeline(p, box, log)
+  # Calibration only needs a representative slice to measure the distance
+  # distribution. For a large area, shrink to a central sub-box BEFORE fetching,
+  # so we download a few thousand addresses/buildings instead of tens of
+  # thousands — the distribution of a representative slice matches the whole.
+  if p['calibrate_only'] == 'on' && box
+    w_deg = box[2] - box[0]; h_deg = box[3] - box[1]
+    # ~0.04deg ≈ 4.5 km; only shrink if the area is clearly larger than that
+    max_w = 0.045; max_h = 0.040
+    if w_deg > max_w * 1.5 || h_deg > max_h * 1.5
+      cx = (box[0] + box[2]) / 2.0; cy = (box[1] + box[3]) / 2.0
+      nw = [w_deg, max_w].min; nh = [h_deg, max_h].min
+      box = [cx - nw / 2, cy - nh / 2, cx + nw / 2, cy + nh / 2]
+      log.("Calibration: sampling a representative #{(nw * m_lon(cy) / 1000).round(1)} x " \
+           "#{(nh * M_LAT / 1000).round(1)} km slice at the area's center " \
+           "(far faster than the whole region, statistically equivalent).")
+    end
+  end
   cfg = build_cfg(p, box)
   # Render settings drive the embedded Python via ENV, and join the cache
   # key so each distinct look is cached separately (change a knob -> new image).
@@ -3480,6 +5037,16 @@ def run_pipeline(p, box, log)
     return [{ calibrate_only: true, calib: calib }, nil, source, nil, [], box]
   end
 
+  # Closed / inactive institutions mode: find defunct schools, jails, hospitals,
+  # civic buildings via OSM lifecycle tags + (where available) parcels with an
+  # institutional use/owner and a collapsed building value. Stops after.
+  if p['closed_inst'] == 'on'
+    raise 'Closed-institutions mode needs the area box — fill the coordinates or state/county.' unless box
+    cfg[:orig_box] = box
+    closed = find_closed_institutions(cfg, log)
+    return [{ closed_inst: true, closed: closed }, nil, source, nil, [], box]
+  end
+
   # Optional: fetch OSM industrial/railway zones so candidates can be checked
   # for industrial-site / rail-yard context. Needs a box.
   if p['use_zones'] == 'on' && box
@@ -3487,6 +5054,16 @@ def run_pipeline(p, box, log)
       cfg[:zones] = osm_fetch_zones(box, box_key(box), log)
     rescue => e
       log.("Zone fetch skipped: #{e.message}")
+    end
+  end
+
+  # Optional: fetch the road network to measure each candidate's distance to the
+  # nearest road and estimate a street address. Roadless = high-interest.
+  if p['use_roads'] == 'on' && box
+    begin
+      cfg[:roads] = osm_fetch_roads(box, box_key(box), log)
+    rescue => e
+      log.("Road fetch skipped: #{e.message}")
     end
   end
 
@@ -3703,6 +5280,7 @@ def stream_scan(client, p)
     log.("Scan complete in #{(Time.now - t0).round(1)}s — results below.")
     client.write "</div></fieldset>\n"
     client.write results_html(result, lidar, source, lidar_help, lidar_imgs, lidar_box || box)
+    client.write saved_panel_html
   rescue => e
     client.write "<div class=\"logline err\">#{esc(e.class)}: #{esc(e.message)}</div>\n"
     client.write "</div></fieldset>\n"
@@ -3718,7 +5296,7 @@ def respond(client, html)
 end
 
 server = TCPServer.new('127.0.0.1', PORT)
-puts "Structure Hunter console [v47-roof-shape]: http://localhost:#{PORT}  (Ctrl+C to stop)"
+puts "Structure Hunter console [v63-compact-actions]: http://localhost:#{PORT}  (Ctrl+C to stop)"
 
 loop do
   client = server.accept
@@ -3750,6 +5328,51 @@ loop do
       json = JSON.generate(ok: true, count: n)
       client.write "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" \
                    "Content-Length: #{json.bytesize}\r\nConnection: close\r\n\r\n#{json}"
+    elsif method == 'POST' && (req_path == '/save' || req_path == '/unsave' || req_path == '/save/note')
+      body = client.read(headers['content-length'].to_i).to_s
+      f = {}; URI.decode_www_form(body).each { |k, v| f[k] = v }
+      lat = f['lat'].to_f; lng = f['lng'].to_f
+      n = case req_path
+          when '/save'
+            add_saved(lat, lng, { label: f['label'], shape: f['shape'],
+                                  info: f['info'], mode: f['mode'], note: f['note'] })
+          when '/save/note'
+            update_saved_note(lat, lng, f['note'])
+          else
+            remove_saved(lat, lng)
+          end
+      json = JSON.generate(ok: true, count: n)
+      client.write "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" \
+                   "Content-Length: #{json.bytesize}\r\nConnection: close\r\n\r\n#{json}"
+    elsif method == 'POST' && req_path == '/saved/clear'
+      client.read(headers['content-length'].to_i) if headers['content-length']
+      File.delete(SAVED_FILE) if File.exist?(SAVED_FILE)
+      json = JSON.generate(ok: true)
+      client.write "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" \
+                   "Content-Length: #{json.bytesize}\r\nConnection: close\r\n\r\n#{json}"
+    elsif method == 'GET' && (req_path == '/saved/export.csv' || req_path == '/saved/export.geojson')
+      list = load_saved
+      if req_path.end_with?('.csv')
+        out = +"latitude,longitude,label,shape,info,mode,note,saved\n"
+        list.each do |s|
+          row = [s[:lat], s[:lng], s[:label], s[:shape], s[:info], s[:mode], s[:note], s[:at]]
+          out << row.map { |v| %("#{v.to_s.gsub('"', '""')}") }.join(',') << "\n"
+        end
+        ctype = 'text/csv'; fname = 'saved_places.csv'
+      else
+        feats = list.map do |s|
+          { 'type' => 'Feature',
+            'geometry' => { 'type' => 'Point', 'coordinates' => [s[:lng], s[:lat]] },
+            'properties' => { 'label' => s[:label], 'shape' => s[:shape],
+                              'info' => s[:info], 'mode' => s[:mode],
+                              'note' => s[:note], 'saved' => s[:at] } }
+        end
+        out = JSON.generate('type' => 'FeatureCollection', 'features' => feats)
+        ctype = 'application/geo+json'; fname = 'saved_places.geojson'
+      end
+      client.write "HTTP/1.1 200 OK\r\nContent-Type: #{ctype}\r\n" \
+                   "Content-Disposition: attachment; filename=\"#{fname}\"\r\n" \
+                   "Content-Length: #{out.bytesize}\r\nConnection: close\r\n\r\n#{out}"
     elsif method == 'POST' && req_path.to_s.start_with?('/cache/clear')
       client.read(headers['content-length'].to_i) if headers['content-length']
       freed = clear_cache(req_path.include?('clear-laz') ? 'laz' : 'all')

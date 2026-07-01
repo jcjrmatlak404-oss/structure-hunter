@@ -49,6 +49,7 @@ LiDAR doesn't care about records. It sees what is physically present (or what is
 - **Shape & type classifier** — for every candidate, derives a true oriented bounding rectangle, shape family (square, rectangle, long rectangle, L/T-shaped, elongated, circular, irregular), and a *likely type* from shape + real size (shed, possible dwelling, likely dwelling with wing, barn, warehouse, tank/silo, and more). Each comes with a small drawn glyph of the actual footprint, scaled so its on-screen size reflects the real structure size, with a 25 m reference square.
 - **Roof shape** — for LiDAR candidates, reads roof form from the height data (flat / pitched / steep) and sharpens the type guess: a pitched roof on a house-sized rectangle reads as a likely dwelling; a flat one leans shed/commercial; a domed circle is a silo vs a flat-topped tank.
 - **Shape filtering** — tells round storage tanks from buildings using circularity and convex-hull solidity, so a lone tank is flagged but a tank with a building attached still passes.
+- **Shape search** — find buildings by shape two ways: filter to a shape family (long & thin, L/T-shaped, square, circular…), or give a *specific outline* — tap a preset (rectangle, L, T, octagon, diamond…), sketch corners on a click-to-draw pad, or paste coordinates — and every candidate is ranked by how closely it matches. Matching uses Hu invariant moments, so it's rotation-, scale-, and mirror-independent: the same shape matches at any angle or size.
 
 **Context & accuracy**
 
@@ -63,10 +64,15 @@ LiDAR doesn't care about records. It sees what is physically present (or what is
 
 - **Threshold calibration** — measures the registration distance distribution for your area and recommends the threshold, instead of guessing.
 - **Dismiss & remember** — mark a candidate "not interesting" and it's skipped on future scans (matched by location, survives a cache clear); a collapsible panel lets you review and restore.
+- **Saved-places archive** — a ★ save button on every candidate (in any result mode) adds it to a running investigation archive, capturing what the tool knew about it (likely type, shape, notes, which mode found it) plus an optional note you type. The archive persists across scans and survives cache clears, so it's a genuine running list of everywhere you want to look closer. A dedicated panel lets you review each place, open it in Google Maps, edit its note, or remove it — and **export the whole list to GeoJSON or CSV** to carry into the field (Google Earth, QGIS, a GPS app).
 - **LiDAR focus for big areas** — a county is too large to scan whole, so it focuses windows on the top candidates — choose the top one, the top three, a specific candidate, or "next unexamined," which remembers what you've already looked at and sweeps forward across runs.
 - **Live relief rendering** — re-light and stretch the terrain in your browser instantly (sun direction, vertical exaggeration, hillshade / multi-direction / sky-view / local-relief modes, contrast stretch) to reveal faint foundations, pads, and earthworks.
 - **Parallel downloads & caching** — fetches address/parcel data and LiDAR tiles concurrently (with verification and auto-retry on truncated downloads) and caches everything, so big areas and repeat visits are fast.
 - **Interactive results** — numbered markers on the imagery linked both ways to ranked candidate tables; double-tap any spot to open it in Google Maps satellite view; full results also written to CSV and GeoJSON.
+
+**Specialized searches**
+
+- **Closed institutions & dead retail** — a focused mode (instead of the normal scan) that finds defunct schools, jails, hospitals, and civic buildings, plus dead malls, department stores, and supermarkets. It combines two signals: **OSM lifecycle tags** — sites mappers have marked *disused*, *abandoned*, or *demolished* (works in any state) — and, where a parcel source is set, a **parcel value heuristic**: an institutional or large-retail parcel whose building value has collapsed to near zero, which is the tax records' own signature of a vacated, condemned, or demolished building (the land keeps its value, the structure does not). Results are tagged civic vs retail and point you to state archives, the National Register, dead-mall trackers, and county property records to confirm. Only large-format retail is included, since small shops turn over too often to be a useful signal.
 
 Built-in **About** and two **How-to** guides (search & tuning; reading the imagery) explain the science and the workflow inside the app itself.
 
@@ -166,8 +172,10 @@ See [`DISCLAIMER.md`](DISCLAIMER.md) for the full notice.
 - **Spatial join** uses the shoelace formula (polygon area & centroid) and a grid spatial index for fast nearest-point queries.
 - **LiDAR** builds a Digital Surface Model (highest returns) and a Digital Terrain Model (interpolated bare ground), then subtracts them to get height-above-ground; smooth raised blobs are structure candidates, ragged ones are vegetation. Roughness (height variation across a blob) separates flat roofs from foliage and infers roof form.
 - **Shape analysis** computes a minimum-area oriented bounding rectangle (rotating calipers), circularity (isoperimetric ratio), and solidity (via a monotone-chain convex hull) to classify form and separate tanks from buildings.
+- **Shape matching** builds a signature from Hu invariant moments (computed exactly from the filled polygon via Green's theorem) plus normalized proportions, so two footprints of the same shape match regardless of rotation, scale, or reflection.
 - **Relief rendering** computes hillshade, multi-directional, sky-view, and local-relief shading from the elevation grid — live in the browser — so you can interrogate the same measured data in different ways.
 - **Road and zone analysis** measures point-to-segment distance to the OSM road network and tests point-in-polygon against industrial/institutional land-use.
+- **Closed-institution detection** cross-references OSM lifecycle tags (`disused:`/`abandoned:`/`was:` prefixes) with a parcel heuristic that flags institutional or large-retail parcels whose assessed improvement (building) value has collapsed to near zero.
 
 The full explanation lives in the app's **About** panel.
 
